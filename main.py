@@ -12,7 +12,7 @@ st.markdown("**4 institutional-grade signals • Full 12-month backtest • 89�
 # Auto-refresh every 45 seconds
 if not st.checkbox("Pause auto-refresh", False):
     time.sleep(45)
-    st.experimental_rerun()
+    st.rerun()
 
 # ====================== FETCH LIVE DATA ======================
 @st.cache_data(ttl=55)
@@ -106,4 +106,5 @@ st.warning(f"Next 500M XRP Escrow Unlock → {days_left} days {hours_left}h")
 # Footer
 st.markdown("---")
 st.markdown("**Deployed 24/7 • Zero cost • Used by 9-figure traders**")
+
 st.caption("NFA — DYOR")
