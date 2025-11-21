@@ -17,11 +17,11 @@ st.set_page_config(page_title="XRP Engine v7.3", layout="wide", initial_sidebar_
 st.title("🐳 XRP REVERSAL & BREAKOUT ENGINE v7.3")
 st.markdown("<p style='text-align: center; color: #00ff88; font-size:18px;'>Real Binance Signed Netflow • FinBERT News • L/S Ratio • XRPL On-Chain • Whale Flow • Funding History • ML Dynamic Weights • Dynamic Backtest • Arbitrage Detector</p>", unsafe_allow_html=True)
 
-# Auto-refresh
-pause = st.checkbox("Pause auto-refresh", value=False)
-if not pause:
+
+# Auto-refresh every 45 seconds
+if not st.checkbox("Pause auto-refresh", False):
     time.sleep(45)
-    st.experimental_rerun()
+    st.rerun()
 
 @st.cache_data(ttl=55)
 def fetch_data():
@@ -334,3 +334,4 @@ backtest_df = pd.DataFrame({
 st.dataframe(backtest_df.style.background_gradient(subset=["Score"], cmap="Greens"), use_container_width=True)
 
 st.caption("v7.2 • Nov 21 2025 • ML dynamic weights • On-chain XRPL • All errors fixed • Directional arrows • Backtest at bottom • This is the ultimate XRP dashboard")
+
