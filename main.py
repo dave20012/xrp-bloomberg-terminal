@@ -1,4 +1,4 @@
-# main.py — XRP Reversal & Breakout Engine v7.2 — FINAL FIXED + DYNAMIC ML WEIGHTS + ON-CHAIN ANALYTICS (Nov 21 2025)
+# main.py — XRP Reversal & Breakout Engine v7.3 — FINAL WITH HISTORICAL BACKTEST + ARBITRAGE DETECTOR (Nov 21 2025)
 import streamlit as st
 import pandas as pd
 import requests
@@ -12,10 +12,10 @@ import hashlib
 from urllib.parse import urlencode
 from scipy.optimize import minimize
 
-st.set_page_config(page_title="XRP Engine v7.2", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="XRP Engine v7.3", layout="wide", initial_sidebar_state="collapsed")
 
-st.title("🐳 XRP REVERSAL & BREAKOUT ENGINE v7.2")
-st.markdown("<p style='text-align: center; color: #00ff88; font-size:18px;'>Real Binance Signed Netflow • FinBERT News • L/S Ratio • XRPL On-Chain • Whale Flow • Funding History • ML Dynamic Weights • Transparent Backtest</p>", unsafe_allow_html=True)
+st.title("🐳 XRP REVERSAL & BREAKOUT ENGINE v7.3")
+st.markdown("<p style='text-align: center; color: #00ff88; font-size:18px;'>Real Binance Signed Netflow • FinBERT News • L/S Ratio • XRPL On-Chain • Whale Flow • Funding History • ML Dynamic Weights • Dynamic Backtest • Arbitrage Detector</p>", unsafe_allow_html=True)
 
 # Auto-refresh
 pause = st.checkbox("Pause auto-refresh", value=False)
@@ -91,7 +91,7 @@ def fetch_data():
             headers = {"X-MBX-APIKEY": api_key}
             start = ts - 86400000
             dep = requests.get(f"https://api.binance.com/sapi/v1/capital/deposit/hisrec?coin=XRP&startTime={start}&timestamp={ts}&signature={signature}", headers=headers, timeout=10).json()
-            wd  = requests.get(f"https://api.binance.com/sapi/v1/capital/withdraw/history?coin=XRP&startTime={start}&timestamp={ts}&signature={signature}", headers=headers, timeout=10).json()
+            wd  = requests.get("https://api.binance.com/sapi/v1/capital/withdraw/history?coin=XRP&startTime={start}&timestamp={ts}&signature={signature}", headers=headers, timeout=10).json()
             dep_amt = sum(float(d["amount"]) for d in dep if d.get("status") == 1)
             wd_amt = sum(float(w["amount"]) - float(w.get("transactionFee",0)) for w in wd if w.get("status") == 6)
             result["binance_netflow_24h"] = wd_amt - dep_amt
@@ -206,7 +206,7 @@ fund_z = (data["funding_now"] - np.mean(data["funding_hist"])) / (np.std(data["f
 whale_z = data["net_whale_flow"] / 60e6
 netflow_z = data["binance_netflow_24h"] / 100e6
 lsr_z = max(0, (2.0 - data["long_short_ratio"]) / 1.0)
-onchain_activity = 1.0 if result["xrpl_ledger_index"] > 90_000_000 else 0.0
+onchain_activity = 1.0 if data["xrpl_ledger_index"] > 90_000_000 else 0.0
 
 points = {
     "Funding Z-Score": max(0, fund_z * w_fund),
