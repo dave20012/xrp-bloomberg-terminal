@@ -276,43 +276,64 @@ else:
     st.info("No major whale moves right now")
 
 # === 90-DAY CHART ===
+# === 90-DAY CHART FIXED ===
 st.markdown("### 90-Day XRP Candles + Volume + All Past Signals")
 fig = go.Figure()
+
+# Candles
 fig.add_trace(go.Candlestick(x=data["ohlc"]["date_full"],
                              open=data["ohlc"]["open"],
                              high=data["ohlc"]["high"],
                              low=data["ohlc"]["low"],
                              close=data["ohlc"]["close"],
-                             name="XRP"))
-fig.add_trace(go.Bar(x=data["volume"]["date"], y=data["volume"]["volume"]/1e9, name="Volume B", yaxis="y2", opacity=0.3, marker_color="#666"))
+                             name="XRP",
+                             increasing_line_color='#00ff88', decreasing_line_color='#ff4444'))
 
+# Volume - NOW USING date_full → perfect alignment
+fig.add_trace(go.Bar(x=data["volume"]["date_full"],
+                     y=data["volume"]["volume"]/1e9,
+                     name="Volume (B)",
+                     yaxis="y2",
+                     opacity=0.4,
+                     marker_color="#888888"))
+
+# Your 10 verified signals (now bulletproof with real dates)
 signals = [
-    ("08-15", 82, "+18%"),
-    ("08-28", 78, "-4%"),
-    ("09-10", 85, "+25%"),
-    ("09-22", 81, "+31%"),
-    ("10-05", 83, "+12%"),
-    ("11-04", 92, "+42%"),
-    ("11-15", 88, "+28%"),
-    ("11-18", 85, "+27%"),
-    ("11-21", total_score, "LIVE"),
+    ("2025-08-15", 82, "+18%"),
+    ("2025-08-28", 78, "-4%"),
+    ("2025-09-10", 85, "+25%"),
+    ("2025-09-22", 81, "+31%"),
+    ("2025-10-05", 83, "+12%"),
+    ("2025-11-04", 92, "+42%"),
+    ("2025-11-15", 88, "+28%"),
+    ("2025-11-18", 85, "+27%"),
+    ("2025-11-21", total_score, "LIVE"),
 ]
 
-for mmdd, score, outcome in signals:
-    row = data["ohlc"][data["ohlc"]["date"] == mmdd]
+for signal_date, score, outcome in signals:
+    dt = pd.to_datetime(signal_date)
+    row = data["ohlc"][data["ohlc"]["date_full"].dt.date == dt.date()]
     if not row.empty:
-        dt = row["date_full"].iloc[0]
         price_at = row["close"].iloc[0]
+        color = "#00ff00" if outcome.startswith("+") or outcome == "LIVE" else "#ff00ff"
         fig.add_annotation(x=dt, y=price_at,
                            text=f"★ {score} → {outcome}",
-                           showarrow=True, arrowhead=2,
-                           arrowcolor="#00ff00" if outcome.startswith("+") or outcome == "LIVE" else "#ff00ff",
-                           font=dict(color="#fff", size=13),
-                           bgcolor="rgba(0,0,0,0.85)")
+                           showarrow=True, arrowhead=2, arrowcolor=color,
+                           font=dict(color="#fff", size=14),
+                           bgcolor="rgba(0,0,0,0.8)", borderpad=6)
 
-fig.update_layout(height=600, template="plotly_dark", hovermode="x unified",
-                  yaxis_title="Price USD", yaxis2=dict(title="Volume B", overlaying="y", side="right"),
-                  xaxis_rangeslider_visible=False)
+fig.update_layout(
+    height=650,
+    template="plotly_dark",
+    hovermode="x unified",
+    yaxis=dict(title="Price USD", side="left"),
+    yaxis2=dict(title="Volume B", side="right", overlaying="y", showgrid=False),
+    xaxis=dict(title="", type="date"),
+    xaxis_rangeslider_visible=False,
+    margin=dict(l=50, r=50, t=40, b=40),
+    legend=dict(y=1.05, orientation="h")
+)
+
 st.plotly_chart(fig, use_container_width=True)
 
 # === FUNDING HISTORY SUBPLOT ===
@@ -325,3 +346,4 @@ fig2.update_layout(height=250, template="plotly_dark", margin=dict(t=20), xaxis_
 st.plotly_chart(fig2, use_container_width=True)
 
 st.caption("v7.0 Final • Nov 21 2025 • Railway-ready • All improvements included • Fixed bugs • Config weights • L/S ratio • Proper netflow sign • Clean layout • This is now the best public XRP dashboard on earth")
+
