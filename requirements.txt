@@ -1,9 +1,6 @@
 streamlit
-pandas
 requests
+redis
 numpy
+pandas
 plotly
-streamlit-autorefresh
-matplotlib
-scipy
-
