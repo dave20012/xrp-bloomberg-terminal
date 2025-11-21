@@ -190,7 +190,7 @@ with score_col:
         color = "#ff4444"
         signal = "🔴 DISTRIBUTION — CAUTION"
     else:
-        color = "#ffffff"
+        color = "#000"
         signal = "Neutral — Wait for setup"
 
     st.markdown(f'<p style="font-size:130px;color:{color};text-align:center;font-weight:bold;margin-top:20px;">{total_score:.0f}</p>', unsafe_allow_html=True)
@@ -250,3 +250,4 @@ backtest_df = pd.DataFrame({
 st.dataframe(backtest_df.style.background_gradient(subset=["Score"], cmap="Greens"), use_container_width=True)
 
 st caption("v8.1 • Nov 21 2025 • Flippening monitor • Arbitrage detector • All bugs fixed • This is the ultimate XRP dashboard")
+
