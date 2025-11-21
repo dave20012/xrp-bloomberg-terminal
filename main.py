@@ -249,5 +249,6 @@ backtest_df = pd.DataFrame({
 })
 st.dataframe(backtest_df.style.background_gradient(subset=["Score"], cmap="Greens"), use_container_width=True)
 
-st caption("v8.1 • Nov 21 2025 • Flippening monitor • Arbitrage detector • All bugs fixed • This is the ultimate XRP dashboard")
+st.caption("v8.1 • Nov 21 2025 • Flippening monitor • Arbitrage detector • All bugs fixed • This is the ultimate XRP dashboard")
+
 
