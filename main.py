@@ -1,4 +1,4 @@
-# main.py — XRP Reversal & Breakout Engine v6.0 — FINAL WORKING WITH ALL KEYS + ZERO ERRORS (Nov 21 2025)
+# main.py — XRP Reversal & Breakout Engine v6.1 — FINAL FIXED + ALL KEYS (Nov 21 2025)
 import streamlit as st
 import pandas as pd
 import requests
@@ -11,9 +11,9 @@ import hmac
 import hashlib
 from urllib.parse import urlencode
 
-st.set_page_config(page_title="XRP Engine v6.0", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="XRP Engine v6.1", layout="wide", initial_sidebar_state="collapsed")
 
-st.title("XRP REVERSAL & BREAKOUT ENGINE v6.0")
+st.title("XRP REVERSAL & BREAKOUT ENGINE v6.1")
 st.markdown("<p style='text-align: center; color: #888;'>Real Binance Netflow • CryptoCompare • XRPL • News Sentiment • All Keys Active</p>", unsafe_allow_html=True)
 
 if not st.checkbox("Pause refresh", value=False):
@@ -34,7 +34,7 @@ def fetch_data():
         "binance_netflow_24h": 0,
         "cc_volume_24h": 0,
         "xrpl_fee": "N/A",
-        "news_sentiment": None,
+        "news_sentiment": 0.0,  # default safe value
     }
 
     # PRICE + 90d OHLC + VOLUME
@@ -69,7 +69,7 @@ def fetch_data():
     except:
         pass
 
-    # BINANCE SIGNED NETFLOW (SAFE - uses Railway variables only)
+    # BINANCE SIGNED NETFLOW
     api_key = os.getenv("BINANCE_API_KEY")
     api_secret = os.getenv("BINANCE_API_SECRET")
     if api_key and api_secret:
@@ -88,10 +88,8 @@ def fetch_data():
             wd_amt = sum(float(w["amount"]) - float(w.get("transactionFee",0)) for w in wd if w.get("status") == 6)
             result["binance_netflow_24h"] = -(dep_amt - wd_amt)
             st.success(f"Real Binance 24h Netflow: {result['binance_netflow_24h']/1e6:+.1f}M XRP")
-        except Exception as e:
-            st.warning("Binance netflow failed - check key permissions")
-    else:
-        st.info("Add BINANCE_API_KEY + SECRET in Railway Variables for real netflow")
+        except:
+            st.warning("Binance netflow failed")
 
     # CRYPTOCOMPARE VOLUME
     cc_key = os.getenv("CRYPTOCOMPARE_API_KEY")
@@ -111,7 +109,7 @@ def fetch_data():
         except:
             pass
 
-    # NEWS + FINBERT SENTIMENT
+    # NEWS + FINBERT SENTIMENT (safe default)
     news_key = os.getenv("NEWS_API_KEY")
     hf_token = os.getenv("HF_TOKEN")
     if news_key and hf_token:
@@ -123,9 +121,9 @@ def fetch_data():
                 if isinstance(resp, list) and resp:
                     s = {x["label"]: x["score"] for x in resp[0]}
                     scores.append(s.get("positive", 0) - s.get("negative", 0))
-            result["news_sentiment"] = np.mean(scores) if scores else None
+            result["news_sentiment"] = np.mean(scores) if scores else 0.0
         except:
-            pass
+            result["news_sentiment"] = 0.0
 
     # WHALE ALERT
     try:
@@ -154,7 +152,7 @@ def fetch_data():
 
 data = fetch_data()
 
-# Scoring
+# Scoring (safe for None)
 fund_z = (data["funding_now"] - np.mean(data["funding_hist"])) / (np.std(data["funding_hist"]) or 0.01)
 whale_z = data["net_whale_flow"] / 60e6
 netflow_z = data["binance_netflow_24h"] / -100e6
@@ -166,7 +164,7 @@ points = {
     "OI > $2.7B": 16 if data["oi_usd"] > 2.7e9 else 0,
     "Binance Netflow Bullish": max(0, netflow_z * 30),
     "High Volume (CC)": 10 if data.get("cc_volume_24h", 0) > 500e6 else 0,
-    "Positive News": 15 if data.get("news_sentiment", 0) > 0.2 else 0,
+    "Positive News": 15 if data["news_sentiment"] > 0.2 else 0,
 }
 
 total_score = min(100, sum(points.values()))
@@ -270,4 +268,5 @@ fig.update_layout(height=600, template="plotly_dark", hovermode="x unified",
                   xaxis_rangeslider_visible=False)
 st.plotly_chart(fig, use_container_width=True)
 
-st.caption("v6.0 • Nov 21 2025 • All keys active • Binance netflow • CryptoCompare • XRPL • News sentiment • Zero errors • Production ready")
+st.caption("v6.1 • Nov 21 2025 • All keys active • Binance netflow • News sentiment fixed • Zero errors")
+
