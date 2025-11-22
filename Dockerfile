@@ -13,4 +13,4 @@ COPY . .
 RUN pip install --upgrade pip
 RUN pip install -r requirements.txt
 
-CMD ["streamlit", "run", "main.py"]
+CMD streamlit run main.py --server.port ${PORT} --server.address 0.0.0.0
