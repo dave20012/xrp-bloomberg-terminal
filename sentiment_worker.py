@@ -137,8 +137,9 @@ def run_once():
     return payload
 
 def datetime_str():
-    from datetime import datetime
-    return datetime.utcnow().isoformat() + "Z"
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
 
 def run_loop():
     while True:
@@ -150,3 +151,4 @@ def run_loop():
 
 if __name__ == "__main__":
     run_loop()
+
