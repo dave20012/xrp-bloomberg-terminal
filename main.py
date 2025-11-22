@@ -18,7 +18,7 @@ st.markdown("<p style='text-align: center; color: #00ff88; font-size:18px;'>Real
 # Auto refresh
 META_REFRESH_SECONDS = int(os.getenv("META_REFRESH_SECONDS", "45"))
 st.markdown(f'<meta http-equiv="refresh" content="{META_REFRESH_SECONDS}">', unsafe_allow_html=True)
-REQUEST_TIMEOUT = 10
+REQUESTREQUEST_TIMEOUT = 10
 
 # ========================= #
 # OHLC + Volume — BULLETPROOF
@@ -81,7 +81,7 @@ def fetch_live():
     # Price
     try:
         r = requests.get("https://api.coingecko.com/api/v3/simple/price",
-                         params={"ids": "ripple", "vs_currencies": "usd"}, timeout=_TIMEOUT)
+                         params={"ids": "ripple", "vs_currencies": "usd"}, timeout=REQUEST_TIMEOUT)
         if r.ok:
             result["price"] = r.json()["ripple"]["usd"]
     except: pass
@@ -89,7 +89,7 @@ def fetch_live():
     # Funding rate
     try:
         r = requests.get("https://fapi.binance.com/fapi/v1/premiumIndex",
-                         params={"symbol": "XRPUSDT"}, timeout=_TIMEOUT)
+                         params={"symbol": "XRPUSDT"}, timeout=REQUEST_TIMEOUT)
         if r.ok:
             result["funding_now_pct"] = float(r.json()["lastFundingRate"]) * 100
     except: pass
@@ -97,7 +97,7 @@ def fetch_live():
     # Open Interest
     try:
         r = requests.get("https://fapi.binance.com/fapi/v1/openInterest",
-                         params={"symbol": "XRPUSDT"}, timeout=_TIMEOUT)
+                         params={"symbol": "XRPUSDT"}, timeout=REQUEST_TIMEOUT)
         if r.ok:
             oi_contracts = float(r.json()["openInterest"])
             if result["price"]:
@@ -107,7 +107,7 @@ def fetch_live():
     # Funding history (for Z-score)
     try:
         r = requests.get("https://fapi.binance.com/fapi/v1/fundingRate",
-                         params={"symbol": "XRPUSDT", "limit": 200}, timeout=_TIMEOUT)
+                         params={"symbol": "XRPUSDT", "limit": 200}, timeout=REQUEST_TIMEOUT)
         if r.ok:
             rates = [float(x["fundingRate"]) * 100 for x in r.json()[-90:]]
             result["funding_hist_pct"] = rates
@@ -116,7 +116,7 @@ def fetch_live():
     # Long/Short ratio
     try:
         r = requests.get("https://fapi.binance.com/futures/data/globalLongShortAccountRatio",
-                         params={"symbol": "XRPUSDT", "period": "5m", "limit": 1}, timeout=_TIMEOUT)
+                         params={"symbol": "XRPUSDT", "period": "5m", "limit": 1}, timeout=REQUEST_TIMEOUT)
         if r.ok and r.json():
             result["long_short_ratio"] = float(r.json()[0]["longShortRatio"])
     except: pass
@@ -135,11 +135,11 @@ def fetch_live():
             query_string = urlencode(params)
             signature = hmac.new(api_secret.encode(), query_string.encode(), hashlib.sha256).hexdigest()
             dep_url = f"{base}/sapi/v1/capital/deposit/hisrec?{query_string}&signature={signature}"
-            dep = requests.get(dep_url, headers={"X-MBX-APIKEY": api_key}, timeout=_TIMEOUT).json()
+            dep = requests.get(dep_url, headers={"X-MBX-APIKEY": api_key}, timeout=REQUEST_TIMEOUT).json()
 
             # Withdrawals
             wd_url = f"{base}/sapi/v1/capital/withdraw/history?{query_string}&signature={signature}"
-            wd = requests.get(wd_url, headers={"X-MBX-APIKEY": api_key}, timeout=_TIMEOUT).json()
+            wd = requests.get(wd_url, headers={"X-MBX-APIKEY": api_key}, timeout=REQUEST_TIMEOUT).json()
 
             dep_amt = sum(float(d.get("amount", 0)) for d in dep if d.get("status") == 1)
             wd_amt = sum(float(w.get("amount", 0)) - float(w.get("transactionFee", 0)) 
@@ -292,6 +292,7 @@ else:
 # Footer
 # ========================= #
 st.caption("v8.5 — Bulletproof chart + Railway shared vars fixed • Running on ↑↑↑")
+
 
 
 
