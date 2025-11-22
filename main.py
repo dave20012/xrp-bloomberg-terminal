@@ -40,7 +40,7 @@ def get_chart_data():
         df["low"] = df["price"]
         df["close"] = df["price"]
         df = df.merge(volumes, on="ts", how="left")
-        df["volume"] = df["volume"].fillna(0)
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
         return df[["date", "open", "high", "low", "close", "volume"]]
     except Exception as e:
         st.error(f"CoinGecko fetch failed: {e}")
@@ -289,6 +289,7 @@ else:
 # Footer
 # ========================= #
 st.caption("v8.5 — Bulletproof chart + Railway shared vars fixed • Running on ↑↑↑")
+
 
 
 
