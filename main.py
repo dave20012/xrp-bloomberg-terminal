@@ -250,39 +250,48 @@ chart_df = get_chart_data()
 
 if not chart_df.empty:
     fig = go.Figure()
+
+    # Price (top chart)
     fig.add_trace(go.Candlestick(
         x=chart_df["date"],
         open=chart_df["open"],
         high=chart_df["high"],
         low=chart_df["low"],
         close=chart_df["close"],
-        name="XRP",
+        name="Price",
         increasing_line_color='#26a69a',
-        decreasing_line_color='#ef5350'
+        decreasing_line_color='#ef5350',
+        yaxis="y1"
     ))
+
+    # Volume (bottom chart, independent scale)
     fig.add_trace(go.Bar(
         x=chart_df["date"],
-        y=chart_df["volume"] / 1e9,
-        name="Volume (B USD)",
+        y=chart_df["volume"],
+        name="Volume",
         marker_color='rgba(100,150,255,0.4)',
         yaxis="y2"
     ))
+
     fig.update_layout(
         height=700,
         template="plotly_dark",
         xaxis=dict(rangeslider_visible=False),
-        yaxis=dict(title="Price (USD)", domain=[0.3, 1.0]),
-        yaxis2=dict(title="Volume (B USD)", overlaying="y", side="right", domain=[0, 0.25]),
+        yaxis=dict(title="Price (USD)", domain=[0.35, 1.0]),  # top chart
+        yaxis2=dict(title="Volume (USD)", domain=[0, 0.3]),    # bottom chart
         hovermode="x unified",
-        margin=dict(l=50,r=50,t=50,b=50)
+        margin=dict(l=50, r=50, t=50, b=50)
     )
+
     st.plotly_chart(fig, use_container_width=True)
 else:
     st.error("Chart data unavailable — both CoinGecko and Binance failed")
+
 
 # ========================= #
 # Footer
 # ========================= #
 st.caption("v8.5 — Bulletproof chart + Railway shared vars fixed • Running on ↑↑↑")
+
 
 
