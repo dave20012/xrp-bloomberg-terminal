@@ -1,11 +1,14 @@
-# ================= MAIN — XRP REVERSAL & BREAKOUT ENGINE v9.0 ================= #
-# XRP-only terminal with:
-# - XRPL exchange inflows (Redis)
-# - Binance netflow (signed)
-# - Funding, OI, L/S ratio
-# - News sentiment (Redis from sentiment_worker)
+# ================= XRP REVERSAL & BREAKOUT ENGINE v10.1 ================= #
+# World-class XRP-only dashboard:
+# - XRPL Inflows (Redis: xrpl:latest_inflows)
+# - Binance netflow (signed) for XRP
+# - Funding, OI, Long/Short ratio
+# - News sentiment (Redis: news:sentiment)
 # - XRP/BTC & XRP/ETH ratios (flip monitor)
-# - Simplified backtest (SMA cross + volume spike) + chart annotations
+# - Robust OHLC + volume (CoinGecko + Binance fallback)
+# - Simplified SMA/volume backtest + on-chart signal annotations
+# - Whale inflow table
+# - Basic/Advanced view toggle
 
 import os
 import time
@@ -22,29 +25,31 @@ import plotly.graph_objects as go
 
 from redis_client import rdb
 
-# ========================= CONFIG ========================= #
+# ============================= CONFIG ============================= #
+
 REFRESH_SECONDS = int(os.getenv("META_REFRESH_SECONDS", "45"))
 REQUEST_TIMEOUT = 10
 
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 
-# ========================= PAGE SETUP ========================= #
+# ============================= PAGE SETUP ============================= #
+
 st.set_page_config(
-    page_title="XRP Engine v9.0",
+    page_title="XRP Engine v10.1",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
 
-st.title("XRP REVERSAL & BREAKOUT ENGINE v9.0")
+st.title("XRP REVERSAL & BREAKOUT ENGINE v10.1")
 st.markdown(
     "<p style='text-align:center;color:#00ff88;'>"
-    "XRPL Inflows • Binance Netflow • XRP/BTC & XRP/ETH Ratios • News Sentiment • Backtest"
+    "XRPL Inflows • Binance Netflow • XRP/BTC & XRP/ETH Ratios • News Sentiment • 90D Backtest"
     "</p>",
     unsafe_allow_html=True,
 )
 
-# Auto refresh with optional pause
+# Auto refresh with pause toggle
 pause_refresh = st.checkbox("Pause auto-refresh", value=False)
 if not pause_refresh:
     st.markdown(
@@ -52,10 +57,13 @@ if not pause_refresh:
         unsafe_allow_html=True,
     )
 
-# ========================= HELPERS ========================= #
-def safe_get(url, params=None):
+show_advanced = st.checkbox("Show advanced analytics", value=True)
+
+# ============================= HELPERS ============================= #
+
+def safe_get(url, params=None, timeout=REQUEST_TIMEOUT):
     try:
-        r = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        r = requests.get(url, params=params, timeout=timeout)
         if r.ok:
             return r.json()
     except:
@@ -63,64 +71,136 @@ def safe_get(url, params=None):
     return None
 
 
-# ========================= PRICE & RATIO ========================= #
+def safe_post(url, headers=None, json_payload=None, timeout=REQUEST_TIMEOUT):
+    try:
+        r = requests.post(url, headers=headers, json=json_payload, timeout=timeout)
+        if r.ok:
+            return r.json()
+    except:
+        pass
+    return None
+
+
+# ============================= PRICE & RATIOS ============================= #
+
 def get_xrp_price_and_ratios():
+    """
+    Try CoinGecko first, then fall back to Binance spot tickers.
+    Returns: (xrp_usd, xrp_btc, xrp_eth)
+    """
+    # 1) CoinGecko
     data = safe_get(
         "https://api.coingecko.com/api/v3/simple/price",
         {"ids": "ripple,bitcoin,ethereum", "vs_currencies": "usd"},
     )
-    if not data:
-        return None, None, None
-    xrp = data["ripple"]["usd"]
-    btc = data["bitcoin"]["usd"]
-    eth = data["ethereum"]["usd"]
-    return xrp, xrp / btc if btc else None, xrp / eth if eth else None
+    if data:
+        try:
+            x = float(data["ripple"]["usd"])
+            b = float(data["bitcoin"]["usd"])
+            e = float(data["ethereum"]["usd"])
+            return x, (x / b if b else None), (x / e if e else None)
+        except:
+            pass
+
+    # 2) Binance spot tickers (USDT pairs)
+    ticker_map = {}
+    for sym in ["XRPUSDT", "BTCUSDT", "ETHUSDT"]:
+        t = safe_get("https://api.binance.com/api/v3/ticker/price", {"symbol": sym})
+        if not t:
+            continue
+        try:
+            ticker_map[sym] = float(t["price"])
+        except:
+            pass
+
+    x = ticker_map.get("XRPUSDT")
+    b = ticker_map.get("BTCUSDT")
+    e = ticker_map.get("ETHUSDT")
+
+    if x:
+        return x, (x / b if b else None), (x / e if e else None)
+    return None, None, None
 
 
-# ========================= OHLC + VOLUME ========================= #
+# ============================= OHLC + VOLUME ============================= #
+
 @st.cache_data(ttl=600)
 def get_chart_data():
     """
-    90-day daily candles & volume from CoinGecko.
-    Fallback can be added, but this keeps it simple and cached.
+    90-day daily candles & volume.
+    1) CoinGecko market_chart (daily)
+    2) Fallback: Binance /api/v3/klines 1d XRPUSDT
+    Returns DataFrame: [date, open, high, low, close, volume]
     """
-    data = safe_get(
+    # 1) CoinGecko
+    cg = safe_get(
         "https://api.coingecko.com/api/v3/coins/ripple/market_chart",
         {"vs_currency": "usd", "days": "90", "interval": "daily"},
     )
-    if not data:
-        return pd.DataFrame()
+    if cg:
+        try:
+            prices = pd.DataFrame(cg["prices"], columns=["ts", "price"])
+            vols = pd.DataFrame(cg["total_volumes"], columns=["ts", "volume"])
+            df = prices.copy()
+            df["date"] = pd.to_datetime(df["ts"], unit="ms")
+            df["open"] = df["price"]
+            df["high"] = df["price"]
+            df["low"] = df["price"]
+            df["close"] = df["price"]
+            df = df.merge(vols, on="ts")
+            df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
+            return df[["date", "open", "high", "low", "close", "volume"]]
+        except:
+            pass
 
-    prices = pd.DataFrame(data["prices"], columns=["ts", "price"])
-    vols = pd.DataFrame(data["total_volumes"], columns=["ts", "volume"])
+    # 2) Binance klines
+    kl = safe_get(
+        "https://api.binance.com/api/v3/klines",
+        {"symbol": "XRPUSDT", "interval": "1d", "limit": 90},
+    )
+    if kl:
+        try:
+            df = pd.DataFrame(
+                kl,
+                columns=[
+                    "open_time",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume",
+                    "close_time",
+                    "quote_vol",
+                    "trades",
+                    "tb_base",
+                    "tb_quote",
+                    "ignore",
+                ],
+            )
+            df["date"] = pd.to_datetime(df["open_time"], unit="ms")
+            for c in ["open", "high", "low", "close", "volume"]:
+                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+            return df[["date", "open", "high", "low", "close", "volume"]]
+        except:
+            pass
 
-    df = prices.copy()
-    df["date"] = pd.to_datetime(df["ts"], unit="ms")
-    df["open"] = df["price"]
-    df["high"] = df["price"]
-    df["low"] = df["price"]
-    df["close"] = df["price"]
-
-    df = df.merge(vols, on="ts")
-    df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
-
-    return df[["date", "open", "high", "low", "close", "volume"]]
+    return pd.DataFrame()
 
 
-# ========================= XRPL INFLOWS TABLE ========================= #
+# ============================= XRPL INFLOWS TABLE ============================= #
+
 @st.cache_data(ttl=60)
 def load_xrpl_inflows():
     """
-    Expected from xrpl_inflow_monitor.py:
-    [
-      {"ts": 1234567890, "xrp": 123456789, "to": "...", "type": "deposit"},
-      ...
-    ]
+    Expected Redis key (from xrpl_inflow_monitor.py):
+    "xrpl:latest_inflows" -> JSON list of dicts:
+      [{"ts": unix_time, "xrp": <amount>, "to": "<exchange>", "type": "deposit"}, ...]
     """
     try:
         raw = rdb.get("xrpl:latest_inflows")
         if not raw:
             return pd.DataFrame()
+
         flows = json.loads(raw) if isinstance(raw, str) else raw
         if not isinstance(flows, list):
             return pd.DataFrame()
@@ -129,10 +209,11 @@ def load_xrpl_inflows():
         for f in flows:
             ts = f.get("ts")
             dt = pd.to_datetime(ts, unit="s") if ts is not None else None
+            amt_xrp = f.get("xrp", 0) or 0
             rows.append(
                 {
                     "Time (UTC)": dt,
-                    "Amount (M XRP)": (f.get("xrp", 0) or 0) / 1e6,
+                    "Amount (M XRP)": amt_xrp / 1e6,  # assume xrp amount is raw XRP
                     "Exchange": f.get("to", "unknown"),
                     "Type": f.get("type", "deposit"),
                 }
@@ -145,7 +226,8 @@ def load_xrpl_inflows():
         return pd.DataFrame()
 
 
-# ========================= LIVE BINANCE + XRPL ========================= #
+# ============================= LIVE METRICS ============================= #
+
 def fetch_live():
     out = {
         "price": 0.0,
@@ -154,15 +236,15 @@ def fetch_live():
         "oi_usd": 0.0,
         "ls_ratio": 1.0,
         "binance_netflow_24h": 0.0,
-        "xrpl_net_inflow": 0.0,
+        "xrpl_net_inflow_xrp": 0.0,
         "xrp_btc": None,
         "xrp_eth": None,
     }
 
     # Price + ratios
-    price, xbtc, xeth = get_xrp_price_and_ratios()
-    if price:
-        out["price"] = price
+    px, xbtc, xeth = get_xrp_price_and_ratios()
+    if px:
+        out["price"] = px
     out["xrp_btc"] = xbtc
     out["xrp_eth"] = xeth
 
@@ -170,7 +252,7 @@ def fetch_live():
     fr = safe_get("https://fapi.binance.com/fapi/v1/premiumIndex", {"symbol": "XRPUSDT"})
     if fr:
         try:
-            out["funding_now_pct"] = float(fr["lastFundingRate"]) * 100
+            out["funding_now_pct"] = float(fr["lastFundingRate"]) * 100.0
         except:
             pass
 
@@ -181,9 +263,7 @@ def fetch_live():
     )
     if fh:
         try:
-            out["funding_hist_pct"] = [
-                float(x["fundingRate"]) * 100 for x in fh[-90:]
-            ]
+            out["funding_hist_pct"] = [float(x["fundingRate"]) * 100.0 for x in fh[-90:]]
         except:
             pass
 
@@ -210,7 +290,7 @@ def fetch_live():
         except:
             pass
 
-    # Binance signed netflow (XRP)
+    # Binance signed netflow (XRP only)
     if BINANCE_API_KEY and BINANCE_API_SECRET:
         try:
             ts = int(time.time() * 1000)
@@ -223,12 +303,8 @@ def fetch_live():
             ).hexdigest()
             headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
 
-            dep = safe_get(
-                f"{base}/sapi/v1/capital/deposit/hisrec?{qs}&signature={sig}"
-            )
-            wd = safe_get(
-                f"{base}/sapi/v1/capital/withdraw/history?{qs}&signature={sig}"
-            )
+            dep = safe_get(f"{base}/sapi/v1/capital/deposit/hisrec?{qs}&signature={sig}")
+            wd = safe_get(f"{base}/sapi/v1/capital/withdraw/history?{qs}&signature={sig}")
 
             dep_amt = (
                 sum(float(d.get("amount", 0)) for d in dep if d.get("status") == 1)
@@ -244,19 +320,21 @@ def fetch_live():
                 if wd
                 else 0.0
             )
-            out["binance_netflow_24h"] = wd_amt - dep_amt
+            out["binance_netflow_24h"] = wd_amt - dep_amt  # positive = net outflow from Binance
         except:
             pass
 
-    # XRPL net inflow (sum of last snapshot)
-    inflows_df = load_xrpl_inflows()
-    if not inflows_df.empty:
-        out["xrpl_net_inflow"] = inflows_df["Amount (M XRP)"].sum()
+    # XRPL inflows (net sum of latest snapshot)
+    xrpl_df = load_xrpl_inflows()
+    if not xrpl_df.empty:
+        # Convert M XRP back to XRP for scoring scale if needed
+        out["xrpl_net_inflow_xrp"] = float(xrpl_df["Amount (M XRP)"].sum() * 1e6)
 
     return out
 
 
-# ========================= NEWS SENTIMENT (REDIS) ========================= #
+# ============================= NEWS SENTIMENT (REDIS) ============================= #
+
 def read_sentiment():
     try:
         raw = rdb.get("news:sentiment")
@@ -272,7 +350,8 @@ def read_sentiment():
     return {"score": 0.0, "count": 0, "timestamp": None}
 
 
-# ========================= SCORING ENGINE ========================= #
+# ============================= SCORING ENGINE ============================= #
+
 def compute_score(live, news):
     fund_hist = live.get("funding_hist_pct") or [0.0]
     fund_now = live.get("funding_now_pct") or 0.0
@@ -283,33 +362,34 @@ def compute_score(live, news):
     oi = live.get("oi_usd") or 0.0
     price = live.get("price") or 0.0
     net_binance = live.get("binance_netflow_24h") or 0.0
-    xrpl_flow_m = live.get("xrpl_net_inflow") or 0.0
+    xrpl_xrp = live.get("xrpl_net_inflow_xrp") or 0.0
+    news_score = news.get("score", 0.0) or 0.0
 
     pts = {
-        "Funding Z-Score": max(0.0, fund_z * 22),
-        "Whale Flow (XRPL)": max(0.0, xrpl_flow_m / 60e6 * 14),  # scaled
+        "Funding Z-Score": max(0.0, fund_z * 22.0),
+        "Whale Flow (XRPL)": max(0.0, xrpl_xrp / 60e6 * 14.0),  # 60M XRP ~ 14 pts
         "Price < $2.45": 28.0 if price < 2.45 else 0.0,
         "OI > $2.7B": 16.0 if oi > 2.7e9 else 0.0,
-        "Binance Netflow Bullish": max(0.0, net_binance / 100e6 * 30),
-        "Short Squeeze Setup": max(0.0, (2.0 - ls) * 20),
-        "Positive News": 15.0 if news.get("score", 0.0) > 0.2 else 0.0,
+        "Binance Netflow Bullish": max(0.0, net_binance / 100e6 * 30.0),
+        "Short Squeeze Setup": max(0.0, (2.0 - ls) * 20.0),
+        "Positive News": 15.0 if news_score > 0.2 else 0.0,
     }
+
     total = min(100.0, sum(pts.values()))
     return total, pts, fund_z
 
 
-# ========================= SIMPLE BACKTEST (PRICE-ONLY) ========================= #
+# ============================= SIMPLE SMA BACKTEST ============================= #
+
 @st.cache_data(ttl=600)
 def compute_backtest(chart_df: pd.DataFrame):
     """
-    Simplified historical backtest based only on:
+    Simplified backtest on price only:
     - SMA(10) crossing above SMA(30)
     - Volume > 1.2x 10-day average volume
-
-    For each signal:
-    - Entry at today's close
-    - Exit 10 days later (or last bar)
-    - Compute % return
+    Entry: signal day close
+    Exit: 10 bars later (or last bar)
+    Returns metrics + list of signals for annotation.
     """
     df = chart_df.copy()
     if df.empty:
@@ -328,16 +408,14 @@ def compute_backtest(chart_df: pd.DataFrame):
     df["vol_ma"] = df["volume"].rolling(10).mean()
 
     signals = []
-    returns_pct = []
+    rets = []
 
     for i in range(31, len(df) - 10):
-        # Cross above + volume condition
         prev_fast = df.loc[i - 1, "sma_fast"]
         prev_slow = df.loc[i - 1, "sma_slow"]
         fast = df.loc[i, "sma_fast"]
         slow = df.loc[i, "sma_slow"]
-
-        if np.isnan(prev_fast) or np.isnan(prev_slow) or np.isnan(fast) or np.isnan(slow):
+        if any(np.isnan(x) for x in [prev_fast, prev_slow, fast, slow]):
             continue
 
         cross_up = prev_fast <= prev_slow and fast > slow
@@ -347,27 +425,25 @@ def compute_backtest(chart_df: pd.DataFrame):
             continue
 
         entry_price = df.loc[i, "close"]
-        exit_idx = i + 10
-        if exit_idx >= len(df):
-            exit_idx = len(df) - 1
-        exit_price = df.loc[exit_idx, "close"]
-
         if entry_price <= 0:
             continue
 
-        ret = (exit_price / entry_price - 1.0) * 100.0
-        returns_pct.append(ret)
+        exit_idx = min(i + 10, len(df) - 1)
+        exit_price = df.loc[exit_idx, "close"]
+        ret_pct = (exit_price / entry_price - 1.0) * 100.0
+        rets.append(ret_pct)
+
         signals.append(
             {
                 "date": df.loc[i, "date"],
                 "price": float(entry_price),
                 "exit_date": df.loc[exit_idx, "date"],
                 "exit_price": float(exit_price),
-                "ret_pct": float(ret),
+                "ret_pct": float(ret_pct),
             }
         )
 
-    if not returns_pct:
+    if not rets:
         return {
             "num_trades": 0,
             "win_rate": 0.0,
@@ -377,18 +453,16 @@ def compute_backtest(chart_df: pd.DataFrame):
             "signals": [],
         }
 
-    rets = np.array(returns_pct)
+    rets = np.array(rets)
     num_trades = len(rets)
     win_rate = float((rets > 0).sum() / num_trades * 100.0)
     avg_return = float(rets.mean())
 
-    # Equity curve and drawdown
     eq = np.cumprod(1.0 + rets / 100.0)
     peak = np.maximum.accumulate(eq)
-    dd = eq / peak - 1.0
-    max_drawdown = float(dd.min() * 100.0)
+    drawdown = eq / peak - 1.0
+    max_drawdown = float(drawdown.min() * 100.0)
 
-    # Sharpe approximation: trades ~ independent periods
     std = rets.std()
     sharpe = float((rets.mean() / std) * np.sqrt(num_trades)) if std > 1e-8 else 0.0
 
@@ -402,30 +476,29 @@ def compute_backtest(chart_df: pd.DataFrame):
     }
 
 
-# ========================= RENDER UI ========================= #
+# ============================= FETCH + CALCULATE ============================= #
+
 live = fetch_live()
 news = read_sentiment()
-score, score_breakdown, fund_z = compute_score(live, news)
 chart_df = get_chart_data()
+score, score_breakdown, fund_z = compute_score(live, news)
 backtest = compute_backtest(chart_df)
 xrpl_table = load_xrpl_inflows()
 
-# ---- TOP METRICS ---- #
-st.markdown("### Live Metrics")
-mcols = st.columns(7)
-mcols[0].metric("XRP Price", f"${live['price']:.4f}" if live["price"] else "—")
-mcols[1].metric("XRP/BTC", f"{live['xrp_btc']:.8f}" if live["xrp_btc"] else "—")
-mcols[2].metric("XRP/ETH", f"{live['xrp_eth']:.8f}" if live["xrp_eth"] else "—")
-mcols[3].metric("Funding", f"{live['funding_now_pct']:+.4f}%")
-mcols[4].metric("OI (USD)", f"${live['oi_usd']/1e9:.2f}B")
-mcols[5].metric("L/S Ratio", f"{live['ls_ratio']:.2f}")
-mcols[6].metric(
-    "News Sentiment",
-    f"{news['score']:+.3f}",
-    delta=f"{news['count']} articles",
-)
+# ============================= TOP METRICS ============================= #
 
-# ---- SCORE PANEL ---- #
+st.markdown("### Live Metrics")
+m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
+m1.metric("XRP Price", f"${live['price']:.4f}" if live["price"] else "—")
+m2.metric("XRP/BTC", f"{live['xrp_btc']:.8f}" if live["xrp_btc"] else "—")
+m3.metric("XRP/ETH", f"{live['xrp_eth']:.8f}" if live["xrp_eth"] else "—")
+m4.metric("Funding", f"{live['funding_now_pct']:+.4f}%")
+m5.metric("OI (USD)", f"${live['oi_usd']/1e9:.2f}B")
+m6.metric("L/S Ratio", f"{live['ls_ratio']:.2f}")
+m7.metric("News Sentiment", f"{news['score']:+.3f}", f"{news['count']} articles")
+
+# ============================= SCORE PANEL ============================= #
+
 score_col, signal_col = st.columns([1, 2])
 if score >= 80:
     color, label = "#00aa44", "STRONG BUY — REVERSAL LIKELY"
@@ -452,54 +525,60 @@ st.write("**Score breakdown**")
 for k, v in score_breakdown.items():
     st.write(f"• {k}: {v:.1f}")
 
-# ---- LIVE RAW INPUTS ---- #
-st.markdown("### Live Signal Breakdown (raw)")
-for k, v in {
-    "Funding Now (%)": live.get("funding_now_pct"),
-    "Funding Z-Score": round(fund_z, 4),
-    "XRPL Net Inflow (M XRP)": live.get("xrpl_net_inflow"),
-    "Binance Netflow 24h (XRP)": live.get("binance_netflow_24h"),
-    "Open Interest $": live.get("oi_usd"),
-    "L/S Ratio": live.get("ls_ratio"),
-    "News Sentiment": news.get("score"),
-    "News Count": news.get("count"),
-}.items():
-    c_a, c_b = st.columns([3, 1])
-    c_a.write(k)
-    c_b.write(str(v) if v is not None else "—")
+# ============================= RAW INPUTS ============================= #
 
-# ---- BACKTEST PANEL ---- #
-st.markdown("### 90-Day SMA Cross Backtest (Simplified)")
-b1, b2, b3, b4, b5 = st.columns(5)
-b1.metric("Signals", backtest["num_trades"])
-b2.metric("Win Rate", f"{backtest['win_rate']:.1f}%")
-b3.metric("Avg Return / Trade", f"{backtest['avg_return']:+.1f}%")
-b4.metric("Max Drawdown", f"{backtest['max_drawdown']:.1f}%")
-b5.metric("Sharpe (approx)", f"{backtest['sharpe']:.2f}")
+if show_advanced:
+    st.markdown("### Live Signal Breakdown (raw)")
+    for k, v in {
+        "Funding Now (%)": live.get("funding_now_pct"),
+        "Funding Z-Score": round(fund_z, 4),
+        "XRPL Net Inflow (M XRP)": (live.get("xrpl_net_inflow_xrp") or 0.0) / 1e6,
+        "Binance Netflow 24h (XRP)": live.get("binance_netflow_24h"),
+        "Open Interest $": live.get("oi_usd"),
+        "L/S Ratio": live.get("ls_ratio"),
+        "News Sentiment": news.get("score"),
+        "News Count": news.get("count"),
+    }.items():
+        c_a, c_b = st.columns([3, 1])
+        c_a.write(k)
+        c_b.write(str(v) if v is not None else "—")
 
-# ---- XRPL INFLOWS TABLE ---- #
-st.markdown("### XRPL → Exchange Inflows (Last Snapshot)")
-if not xrpl_table.empty:
-    def color_rows(row):
-        # deposit = red background, anything else neutral
-        if row["Type"].lower() == "deposit":
-            return ["background-color: #330000"] * len(row)
-        return [""] * len(row)
+# ============================= BACKTEST PANEL ============================= #
 
-    st.dataframe(
-        xrpl_table.style.apply(color_rows, axis=1),
-        use_container_width=True,
-        hide_index=True,
-    )
-else:
-    st.info("No recent XRPL inflows snapshot found.")
+if show_advanced:
+    st.markdown("### 90-Day SMA + Volume Backtest (Price-only Approximation)")
+    b1, b2, b3, b4, b5 = st.columns(5)
+    b1.metric("Signals", backtest["num_trades"])
+    b2.metric("Win Rate", f"{backtest['win_rate']:.1f}%")
+    b3.metric("Avg Return / Trade", f"{backtest['avg_return']:+.1f}%")
+    b4.metric("Max Drawdown", f"{backtest['max_drawdown']:.1f}%")
+    b5.metric("Sharpe (approx)", f"{backtest['sharpe']:.2f}")
 
-# ---- CHART WITH ANNOTATIONS ---- #
-st.markdown("### 90-Day XRP Chart + Backtest Signals")
+# ============================= XRPL INFLOWS TABLE ============================= #
+
+if show_advanced:
+    st.markdown("### XRPL → Exchange Inflows (Last Snapshot)")
+    if not xrpl_table.empty:
+        def color_rows(row):
+            if row["Type"].lower() == "deposit":
+                return ["background-color: #330000"] * len(row)
+            return [""] * len(row)
+
+        st.dataframe(
+            xrpl_table.style.apply(color_rows, axis=1),
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.info("No recent XRPL inflows snapshot found.")
+
+# ============================= CHART + SIGNAL ANNOTATIONS ============================= #
+
+st.markdown("### 90-Day XRP Candles + Volume + Backtest Signals")
 if not chart_df.empty:
     fig = go.Figure()
 
-    # Price candles
+    # Price
     fig.add_trace(
         go.Candlestick(
             x=chart_df["date"],
@@ -514,7 +593,7 @@ if not chart_df.empty:
         )
     )
 
-    # Volume (bottom pane)
+    # Volume
     fig.add_trace(
         go.Bar(
             x=chart_df["date"],
@@ -525,33 +604,33 @@ if not chart_df.empty:
         )
     )
 
-    # Backtest signal annotations (last N)
-    signals_to_plot = backtest["signals"][-10:] if backtest["signals"] else []
-    for s in signals_to_plot:
-        dt = s["date"]
-        price = s["price"]
-        label_text = f"{s['ret_pct']:+.1f}%"
-        fig.add_trace(
-            go.Scatter(
-                x=[dt],
-                y=[price],
-                mode="markers",
-                marker=dict(color="#ffff00", size=10, symbol="star"),
-                name="Backtest Signal",
-                showlegend=False,
+    # Backtest signals (annotate last 10)
+    if backtest["signals"]:
+        for s in backtest["signals"][-10:]:
+            dt = s["date"]
+            price = s["price"]
+            label_text = f"{s['ret_pct']:+.1f}%"
+            fig.add_trace(
+                go.Scatter(
+                    x=[dt],
+                    y=[price],
+                    mode="markers",
+                    marker=dict(color="#ffff00", size=10, symbol="star"),
+                    name="Backtest Signal",
+                    showlegend=False,
+                )
             )
-        )
-        fig.add_annotation(
-            x=dt,
-            y=price,
-            text=label_text,
-            showarrow=True,
-            arrowhead=2,
-            ax=0,
-            ay=-30,
-            bgcolor="rgba(0,0,0,0.7)",
-            font=dict(color="#ffffff", size=11),
-        )
+            fig.add_annotation(
+                x=dt,
+                y=price,
+                text=label_text,
+                showarrow=True,
+                arrowhead=2,
+                ax=0,
+                ay=-30,
+                bgcolor="rgba(0,0,0,0.7)",
+                font=dict(color="#ffffff", size=11),
+            )
 
     fig.update_layout(
         height=700,
@@ -570,10 +649,11 @@ if not chart_df.empty:
 
     st.plotly_chart(fig, use_container_width=True)
 else:
-    st.error("Chart data unavailable — CoinGecko fetch failed.")
+    st.error("Chart data unavailable — CoinGecko and Binance fallbacks failed.")
 
-# ---- FOOTER ---- #
+# ============================= FOOTER ============================= #
+
 st.caption(
-    "v9.0 — XRP only • XRPL Inflows • Binance Netflow • XRP/BTC & XRP/ETH • "
-    "News Sentiment • Simplified SMA Backtest + Signal Annotations"
+    "v10.1 — XRP-only • XRPL Inflows • Binance Netflow • XRP/BTC & XRP/ETH • "
+    "News Sentiment (cached) • SMA Backtest + Signal Annotations • Robust Fallbacks"
 )
