@@ -18,7 +18,7 @@ st.markdown("<p style='text-align: center; color: #00ff88; font-size:18px;'>Real
 # Auto refresh
 META_REFRESH_SECONDS = int(os.getenv("META_REFRESH_SECONDS", "45"))
 st.markdown(f'<meta http-equiv="refresh" content="{META_REFRESH_SECONDS}">', unsafe_allow_html=True)
-REQUESTREQUEST_TIMEOUT = 10
+REQUEST_TIMEOUT = 10
 
 # ========================= #
 # OHLC + Volume — BULLETPROOF
@@ -153,7 +153,7 @@ def fetch_live():
     try:
         raw = rdb.get("xrpl:latest_inflows")
         if raw:
-            inflows = eval(raw) if isinstance(raw, str) else raw
+            inflows = json.loads(raw) if isinstance(raw, str) else raw
             result["net_whale_flow"] = sum(i.get("xrp", 0) for i in inflows)
     except: pass
 
@@ -292,6 +292,7 @@ else:
 # Footer
 # ========================= #
 st.caption("v8.5 — Bulletproof chart + Railway shared vars fixed • Running on ↑↑↑")
+
 
 
 
