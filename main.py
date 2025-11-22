@@ -131,36 +131,39 @@ def get_xrp_price_and_ratios():
 @st.cache_data(ttl=600)
 def get_chart_data():
     """
-    90-day daily candles & volume.
-    1) CoinGecko market_chart (daily)
-    2) Fallback: Binance /api/v3/klines 1d XRPUSDT
-    Returns DataFrame: [date, open, high, low, close, volume]
+    Correct 90-day daily OHLC + Volume
+    - Uses CoinGecko OHLC endpoint for candles
+    - Uses market_chart only for volume
+    - Falls back to Binance klines if needed
     """
-    # 1) CoinGecko
-    cg = safe_get(
-        "https://api.coingecko.com/api/v3/coins/ripple/market_chart",
-        {"vs_currency": "usd", "days": "90", "interval": "daily"},
+    # ---- 1) CoinGecko OHLC ---- #
+    ohlc = safe_get(
+        "https://api.coingecko.com/api/v3/coins/ripple/ohlc",
+        {"vs_currency": "usd", "days": "90"}
     )
-    if cg:
+    vol = safe_get(
+        "https://api.coingecko.com/api/v3/coins/ripple/market_chart",
+        {"vs_currency": "usd", "days": "90", "interval": "daily"}
+    )
+
+    if ohlc and vol:
         try:
-            prices = pd.DataFrame(cg["prices"], columns=["ts", "price"])
-            vols = pd.DataFrame(cg["total_volumes"], columns=["ts", "volume"])
-            df = prices.copy()
-            df["date"] = pd.to_datetime(df["ts"], unit="ms")
-            df["open"] = df["price"]
-            df["high"] = df["price"]
-            df["low"] = df["price"]
-            df["close"] = df["price"]
-            df = df.merge(vols, on="ts")
+            ohlc_df = pd.DataFrame(ohlc, columns=["ts", "open", "high", "low", "close"])
+            ohlc_df["date"] = pd.to_datetime(ohlc_df["ts"], unit="ms")
+
+            vol_df = pd.DataFrame(vol["total_volumes"], columns=["ts", "volume"])
+            vol_df["date"] = pd.to_datetime(vol_df["ts"], unit="ms")
+
+            df = pd.merge(ohlc_df, vol_df[["date", "volume"]], on="date", how="left")
             df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
             return df[["date", "open", "high", "low", "close", "volume"]]
         except:
             pass
 
-    # 2) Binance klines
+    # ---- 2) Binance fallback ---- #
     kl = safe_get(
         "https://api.binance.com/api/v3/klines",
-        {"symbol": "XRPUSDT", "interval": "1d", "limit": 90},
+        {"symbol": "XRPUSDT", "interval": "1d", "limit": 90}
     )
     if kl:
         try:
@@ -168,27 +171,19 @@ def get_chart_data():
                 kl,
                 columns=[
                     "open_time",
-                    "open",
-                    "high",
-                    "low",
-                    "close",
-                    "volume",
-                    "close_time",
-                    "quote_vol",
-                    "trades",
-                    "tb_base",
-                    "tb_quote",
-                    "ignore",
-                ],
+                    "open","high","low","close","volume",
+                    "close_time","q","t","tb","tbq","i"
+                ]
             )
             df["date"] = pd.to_datetime(df["open_time"], unit="ms")
-            for c in ["open", "high", "low", "close", "volume"]:
-                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
-            return df[["date", "open", "high", "low", "close", "volume"]]
+            for col in ["open","high","low","close","volume"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            return df[["date","open","high","low","close","volume"]]
         except:
             pass
 
     return pd.DataFrame()
+
 
 
 # ============================= XRPL INFLOWS TABLE ============================= #
@@ -723,3 +718,4 @@ st.caption(
     "v10.2 — XRP-only • XRPL Inflows • Binance Netflow • XRP/BTC & XRP/ETH • "
     "News Sentiment (cached) • SMA Backtest + Equity Curve + Signal Annotations • Robust Fallbacks"
 )
+
