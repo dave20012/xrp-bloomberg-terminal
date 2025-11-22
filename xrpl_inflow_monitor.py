@@ -4,6 +4,19 @@ import requests
 import json
 from exchange_addresses import EXCHANGE_ADDRESSES
 from redis_client import rdb
+import logging
+from datetime import datetime
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
+
+# After fetching inflow data
+logging.info(f"Fetched {len(inflow_data)} XRPL inflow records")
+
+# After any processing step
+logging.info(f"Processed inflow data: {summary_stats}")
+
+# Before sending to main reporting service
+logging.info(f"Pushing inflow payload: {payload}")
 
 XRPL_API = "https://s1.ripple.com:51234"
 POLL_SECONDS = int(__import__("os")..getenv("XRPL_POLL_SECONDS", "30"))
@@ -89,3 +102,4 @@ def run_loop():
 
 if __name__ == "__main__":
     run_loop()
+
