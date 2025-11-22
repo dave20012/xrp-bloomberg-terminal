@@ -8,7 +8,8 @@ import requests
 import numpy as np
 from redis_client import rdb
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
+
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 
@@ -152,4 +153,5 @@ def run_loop():
 
 if __name__ == "__main__":
     run_loop()
+
 
