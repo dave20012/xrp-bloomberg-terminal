@@ -1,107 +1,38 @@
-# xrpl_inflow_monitor.py
-import time
-import requests
-import json
-from exchange_addresses import EXCHANGE_ADDRESSES
+# ================= XRPL INFLOW MONITOR v10 ================= #
+# Tracks large inbound flows to exchanges, pushes to Redis list
+
+import time, os, json, logging, requests
 from redis_client import rdb
-import logging
-from datetime import datetime
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+API = "https://api.whale-alert.io/v1/transactions"
+KEY = os.getenv("WHALE_ALERT_KEY")
+RUN = int(os.getenv("XRPL_INFLOWS_INTERVAL", "600"))  # 10m default
 
-XRPL_API = "https://s1.ripple.com:51234"
-POLL_SECONDS = int(__import__("os").getenv("XRPL_POLL_SECONDS", "30"))
-MIN_XRP = float(__import__("os").getenv("XRPL_MIN_XRP", "250000"))  # threshold
-
-def fetch_ledger_index():
-    r = requests.post(XRPL_API, json={"method": "ledger", "params": [{"ledger_index": "validated"}]}, timeout=10)
-    r.raise_for_status()
-    return r.json()["result"]["ledger_index"]
-
-def fetch_tx_in_ledger(ledger_index):
-    r = requests.post(
-        XRPL_API,
-        json={"method": "ledger", "params": [{"ledger_index": ledger_index, "transactions": True, "expand": True}]},
-        timeout=10,
-    )
-    r.raise_for_status()
-    return r.json()["result"]["ledger"].get("transactions", [])
-
-def is_exchange_destination(addr):
-    for ex, accs in EXCHANGE_ADDRESSES.items():
-        if addr in accs:
-            return ex
-    return None
-
-def extract_inflows(txs):
-    events = []
-    for tx in txs:
-        if tx.get("TransactionType") != "Payment":
-            continue
-        amt = tx.get("Amount")
-        if not isinstance(amt, str):
-            continue
-        dest = tx.get("Destination")
-        ex = is_exchange_destination(dest)
-        if not ex:
-            continue
-        try:
-            drops = int(amt)
-        except Exception:
-            continue
-        xrp = drops / 1_000_000.0
-        if xrp < MIN_XRP:
-            continue
-        events.append(
-            {
-                "exchange": ex,
-                "xrp": xrp,
-                "from": tx.get("Account"),
-                "destination": dest,
-                "tx_hash": tx.get("hash"),
-                "timestamp": tx.get("date") if tx.get("date") else None,
-            }
-        )
-    return events
-
-def push_payload(payload):
+def fetch():
     try:
-        # store latest inflows as JSON string
-        rdb.set("xrpl:latest_inflows", json.dumps(payload))
-        # maintain history
-        rdb.lpush("xrpl:inflow_history", json.dumps(payload))
-        rdb.ltrim("xrpl:inflow_history", 0, 199)
-        logging.info(f"Payload successfully pushed: {payload}")
-    except Exception as e:
-        logging.error(f"Failed to push payload: {e}")
+        r=requests.get(API,params={"currency":"xrp","min_value":10000000,"limit":30,"api_key":KEY},timeout=15)
+        if r.ok: return r.json().get("transactions",[])
+    except: pass
+    return []
 
-def run_loop():
-    last_ledger = None
+def handle():
+    tx=fetch(); flows=[]
+    for t in tx:
+        if not isinstance(t,dict): continue
+        if t["to"].get("owner_type")=="exchange":
+            flows.append({"ts":t.get("timestamp"),"xrp":t.get("amount"),"to":t["to"].get("owner"),"type":"deposit"})
+    return flows
+
+def push(lst):
+    try: rdb.set("xrpl:latest_inflows", json.dumps(lst)); logging.info(f"XRPL inflows pushed {len(lst)}")
+    except Exception as e: logging.error(e)
+
+def loop():
     while True:
         try:
-            ledger = fetch_ledger_index()
-            logging.info(f"Fetched latest ledger index: {ledger}")
-            if last_ledger is None:
-                last_ledger = ledger
-                time.sleep(POLL_SECONDS)
-                continue
-            while last_ledger < ledger:
-                last_ledger += 1
-                try:
-                    txs = fetch_tx_in_ledger(last_ledger)
-                    logging.info(f"Fetched {len(txs)} transactions for ledger {last_ledger}")
-                except Exception as e:
-                    logging.error(f"Failed fetching transactions for ledger {last_ledger}: {e}")
-                    continue
-                inflows = extract_inflows(txs)
-                logging.info(f"Processed {len(inflows)} inflow events for ledger {last_ledger}")
-                if inflows:
-                    push_payload(inflows)
-            time.sleep(POLL_SECONDS)
-        except Exception as e:
-            logging.error(f"Main loop error: {e}")
-            time.sleep(POLL_SECONDS)
+            push(handle())
+        except Exception as e: logging.error(e)
+        time.sleep(RUN)
 
-if __name__ == "__main__":
-    run_loop()
-
+if __name__=="__main__": loop()
