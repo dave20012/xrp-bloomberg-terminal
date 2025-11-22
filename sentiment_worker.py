@@ -1,155 +1,83 @@
-# sentiment_worker.py — Modified for debugging and robustness
-import time
-import os
-import json
-import random
-import re
-import requests
-import numpy as np
-from redis_client import rdb
-import logging
-from datetime import datetime, timezone
+# ================= SENTIMENT WORKER v10 ================= #
+# Fetch headlines with strict anti-hype filter, score via FinBERT, push to Redis
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
+import os, time, json, random, re, requests, numpy as np, logging
+from datetime import datetime, timezone
+from redis_client import rdb
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
 NEWS_KEY = os.getenv("NEWS_API_KEY")
 HF_TOKEN = os.getenv("HF_TOKEN")
-PAGE_SIZE = int(os.getenv("SENTIMENT_PAGE_SIZE", "20"))
-TRIM_FRACTION = float(os.getenv("SENTIMENT_TRIM", "0.2"))
-RUN_INTERVAL = int(os.getenv("SENTIMENT_RUN_INTERVAL", "1800"))  # 30m default
+RUN = int(os.getenv("SENTIMENT_RUN_INTERVAL", "1800"))  # 30m
 
-_HYPE = re.compile(
-    r"(price|surge|explode|massive|soars|crashes|moon|bullish|bearish|target|prediction|forecast|huge|urgent|alert|will|may|could|projected)",
-    re.IGNORECASE,
-)
+HYPE = re.compile(r"(price|surge|massive|soars|dip|moon|target|prediction|forecast)", re.IGNORECASE)
 
-# Temporarily relaxed for testing: minimal filtering
-def _reject_headline(t: str) -> bool:
-    if not t:
-        return True
-    t = t.strip()
-    # Remove aggressive hype check and length/uppercase restrictions for testing
-    # if _HYPE.search(t): return True
-    # if len(t.split()) < 5: return True
-    # uc_ratio = sum(1 for c in t if c.isupper()) / max(1, len(t))
-    # if uc_ratio > 0.35: return True
-    # if "XRP" in t.upper() and len(t) < 30: return True
-    return False
+def clean(t):
+    if not t: return False
+    t=t.strip()
+    if len(t.split())<5: return False
+    if HYPE.search(t): return False
+    return True
 
-def fetch_headlines(domains=None):
-    if not NEWS_KEY:
-        return []
-    params = {
-        "q": "(XRP OR Ripple) NOT (BTC OR bitcoin)",
-        "searchIn": "title",
-        "pageSize": PAGE_SIZE,
-        "sortBy": "publishedAt",
-        "language": "en",
-        "apiKey": NEWS_KEY,
-    }
-    if domains:
-        params["domains"] = domains
+def fetch():
+    if not NEWS_KEY: return []
     try:
-        r = requests.get("https://newsapi.org/v2/everything", params=params, timeout=15)
+        r = requests.get("https://newsapi.org/v2/everything",
+                         params={"q":"(XRP OR Ripple)","searchIn":"title","language":"en","pageSize":20,"sortBy":"publishedAt","apiKey":NEWS_KEY}, timeout=15)
+        if not r.ok: return []
+        return r.json().get("articles",[])
+    except: return []
+
+def finbert(text):
+    if not HF_TOKEN: return None
+    try:
+        r = requests.post("https://api-inference.huggingface.co/models/ProsusAI/finbert",
+                          headers={"Authorization":f"Bearer {HF_TOKEN}"}, json={"inputs":text}, timeout=15)
         if not r.ok:
-            logging.warning(f"News API returned bad status: {r.status_code}")
-            return []
-        articles = r.json().get("articles", [])
-        logging.info(f"Fetched {len(articles)} articles from News API")
-        return articles
-    except Exception as e:
-        logging.error(f"Failed fetching headlines: {e}")
-        return []
-
-def finbert_infer(text):
-    if not HF_TOKEN:
-        return None
-    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
-    url = "https://api-inference.huggingface.co/models/ProsusAI/finbert"
-    try:
-        r = requests.post(url, headers=headers, json={"inputs": text}, timeout=15)
-        resp = r.json()
-        logging.info(f"FinBERT response for text '{text[:50]}...': {resp}")  # log raw response
-        if not r.ok or isinstance(resp, dict) or not resp:
-            logging.warning(f"FinBERT API returned bad status for text: {text[:30]}...")
+            logging.warning(f"FinBERT error {r.status_code}: {r.text[:120]}")
             return None
-        d = resp[0]
-        if isinstance(d, dict) and "label" in d:
-            return None
+        res=r.json()
+        if not isinstance(res,list) or not res: return None
         try:
-            scores = {it["label"]: it["score"] for it in d}
-            return float(scores.get("positive", 0.0) - scores.get("negative", 0.0))
-        except Exception as e:
-            logging.error(f"Failed to parse FinBERT response: {e}")
-            return None
+            s={i["label"]:i["score"] for i in res[0]}
+            return s.get("positive",0)-s.get("negative",0)
+        except: return None
     except Exception as e:
-        logging.error(f"FinBERT inference failed: {e}")
-        return None
+        logging.error(e); return None
 
-def compute_trimmed_mean(scores):
-    if not scores:
-        return 0.0
-    arr = np.sort(np.array(scores))
-    k = int(len(arr) * TRIM_FRACTION)
-    trimmed = arr[k: len(arr) - k] if len(arr) > 2 * k else arr
-    return float(np.mean(trimmed))
+def trim(s):
+    if not s: return 0.0
+    a=np.sort(np.array(s)); k=int(len(a)*0.2)
+    return float(np.mean(a[k:len(a)-k] if len(a)>2*k else a))
 
-def datetime_str():
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+def ts(): return datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
 
-def push_payload(payload):
-    try:
-        rdb.set("news:sentiment", json.dumps(payload))
-        logging.info(f"Pushed payload: {payload}")
-    except Exception as e:
-        logging.error(f"Failed to push payload: {e}")
+def push(p):
+    try: rdb.set("news:sentiment", json.dumps(p)); logging.info(f"Pushed → {p}")
+    except Exception as e: logging.error(e)
 
 def run_once():
-    domains = ",".join([
-        "wsj.com", "bloomberg.com", "reuters.com", "ft.com", "fortune.com",
-        "businessinsider.com", "theverge.com", "techcrunch.com", "wired.com", "arstechnica.com"
-    ])
-    articles = fetch_headlines(domains)
-    cleaned = []
-    for a in articles:
-        title = (a.get("title") or "").strip()
-        src = a.get("source", {}).get("name", "unknown")
-        if _reject_headline(title):
-            continue
-        cleaned.append({"source": src, "title": title, "url": a.get("url")})
-    logging.info(f"Processed {len(cleaned)} valid articles")
+    arts=fetch()
+    good=[{"source":a.get("source",{}).get("name"),"title":a.get("title")} for a in arts if clean(a.get("title"))]
+    logging.info(f"Valid headlines: {len(good)}")
+    if not good:
+        push({"timestamp":ts(),"score":0,"count":0,"articles":[]}); return
 
-    if not cleaned:
-        payload = {"timestamp": datetime_str(), "score": 0.0, "count": 0, "articles": []}
-        push_payload(payload)
-        return payload
+    random.shuffle(good)
+    svals=[]; scored=[]
+    for a in good[:12]:
+        sc=finbert(a["title"])
+        scored.append({**a,"score":sc})
+        if sc is not None: svals.append(sc)
+        time.sleep(0.25)
 
-    random.shuffle(cleaned)
-    to_score = cleaned[:12]
-    scored = []
-    scores = []
-    for a in to_score:
-        try:
-            s = finbert_infer(a["title"])
-        except Exception as e:
-            logging.error(f"FinBERT scoring error for title '{a['title']}': {e}")
-            s = None
-        scored.append({"source": a["source"], "title": a["title"], "score": s})
-        if s is not None:
-            scores.append(s)
-        time.sleep(0.35)
-    mean_score = compute_trimmed_mean(scores)
-    payload = {"timestamp": datetime_str(), "score": mean_score, "count": len(scores), "articles": scored}
-    push_payload(payload)
-    return payload
+    push({"timestamp":ts(),"score":trim(svals),"count":len(svals),"articles":scored})
 
 def run_loop():
     while True:
-        try:
-            run_once()
-        except Exception as e:
-            logging.error(f"Run loop error: {e}")
-        time.sleep(RUN_INTERVAL)
+        try: run_once()
+        except Exception as e: logging.error(e)
+        time.sleep(RUN)
 
-if __name__ == "__main__":
-    run_loop()
+if __name__=="__main__": run_loop()
