@@ -1,3 +1,10 @@
 {
-  "apt_packages": ["libjpeg62-turbo", "libjpeg62-turbo-dev", "build-essential", "libssl-dev", "libffi-dev"]
+  "build": {
+    "apt_packages": [
+      "libjpeg62-turbo",
+      "libjpeg62-turbo-dev",
+      "zlib1g",
+      "zlib1g-dev"
+    ]
+  }
 }
