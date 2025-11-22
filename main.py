@@ -1,4 +1,4 @@
-# main.py — XRP REVERSAL & BREAKOUT ENGINE v8.5 — FINAL BULLETPROOF VERSION
+# main.py — XRP REVERSAL & BREAKOUT ENGINE v8.5 — EXCEPT LOGGING ENABLED
 import os
 import hmac
 import hashlib
@@ -9,69 +9,61 @@ import pandas as pd
 import numpy as np
 import requests
 import plotly.graph_objects as go
+import json
 from redis_client import rdb  # assuming you have this file
 
 st.set_page_config(page_title="XRP Engine v8.5", layout="wide", initial_sidebar_state="collapsed")
 st.title("XRP REVERSAL & BREAKOUT ENGINE v8.5")
 st.markdown("<p style='text-align: center; color: #00ff88; font-size:18px;'>Real Binance Netflow • XRPL inflows • News Sentiment (cached) • Market refresh 45s • News refresh 30m</p>", unsafe_allow_html=True)
 
-# Auto refresh
 META_REFRESH_SECONDS = int(os.getenv("META_REFRESH_SECONDS", "45"))
 st.markdown(f'<meta http-equiv="refresh" content="{META_REFRESH_SECONDS}">', unsafe_allow_html=True)
 REQUEST_TIMEOUT = 10
 
-# ========================= #
-# OHLC + Volume — BULLETPROOF
-# ========================= #
 @st.cache_data(ttl=600)
 def get_chart_data():
-    # 1. Try CoinGecko market_chart (daily candles + volume)
     try:
         r = requests.get(
             "https://api.coingecko.com/api/v3/coins/ripple/market_chart",
             params={"vs_currency": "usd", "days": "90", "interval": "daily"},
             timeout=10
         )
-        if r.ok:
-            data = r.json()
-            prices = pd.DataFrame(data["prices"], columns=["ts", "price"])
-            volumes = pd.DataFrame(data["total_volumes"], columns=["ts", "volume"])
-            df = prices.copy()
-            df["date"] = pd.to_datetime(df["ts"], unit="ms").dt.date
-            df["open"] = df["price"]
-            df["high"] = df["price"]
-            df["low"] = df["price"]
-            df["close"] = df["price"]
-            df = df.merge(volumes, on="ts", how="left")
-            df["volume"] = df["volume"].fillna(0)
-            return df[["date", "open", "high", "low", "close", "volume"]]
-    except:
-        pass
+        r.raise_for_status()
+        data = r.json()
+        prices = pd.DataFrame(data["prices"], columns=["ts", "price"])
+        volumes = pd.DataFrame(data["total_volumes"], columns=["ts", "volume"])
+        df = prices.copy()
+        df["date"] = pd.to_datetime(df["ts"], unit="ms").dt.date
+        df["open"] = df["price"]
+        df["high"] = df["price"]
+        df["low"] = df["price"]
+        df["close"] = df["price"]
+        df = df.merge(volumes, on="ts", how="left")
+        df["volume"] = df["volume"].fillna(0)
+        return df[["date", "open", "high", "low", "close", "volume"]]
+    except Exception as e:
+        st.error(f"CoinGecko fetch failed: {e}")
 
-    # 2. Fallback → Binance public daily klines (never rate-limited)
     try:
         r = requests.get(
             "https://api.binance.com/api/v3/klines",
             params={"symbol": "XRPUSDT", "interval": "1d", "limit": 90},
             timeout=10
         )
-        if r.ok:
-            raw = r.json()
-            df = pd.DataFrame(raw, columns=[
-                "open_time", "open", "high", "low", "close", "volume",
-                "close_time", "quote_vol", "trades", "tb_base", "tb_quote", "ignore"
-            ])
-            df["date"] = pd.to_datetime(df["open_time"], unit="ms").dt.date
-            df = df.astype({"open": float, "high": float, "low": float, "close": float, "volume": float})
-            return df[["date", "open", "high", "low", "close", "volume"]]
+        r.raise_for_status()
+        raw = r.json()
+        df = pd.DataFrame(raw, columns=[
+            "open_time", "open", "high", "low", "close", "volume",
+            "close_time", "quote_vol", "trades", "tb_base", "tb_quote", "ignore"
+        ])
+        df["date"] = pd.to_datetime(df["open_time"], unit="ms").dt.date
+        df = df.astype({"open": float, "high": float, "low": float, "close": float, "volume": float})
+        return df[["date", "open", "high", "low", "close", "volume"]]
     except Exception as e:
-        st.error(f"Both data sources failed: {e}")
+        st.error(f"Binance fetch failed: {e}")
 
     return pd.DataFrame()
 
-# ========================= #
-# Live market data
-# ========================= #
 def fetch_live():
     result = {
         "price": None, "funding_now_pct": 0.0, "funding_hist_pct": [], "oi_usd": None,
@@ -82,84 +74,85 @@ def fetch_live():
     try:
         r = requests.get("https://api.coingecko.com/api/v3/simple/price",
                          params={"ids": "ripple", "vs_currencies": "usd"}, timeout=REQUEST_TIMEOUT)
-        if r.ok:
-            result["price"] = r.json()["ripple"]["usd"]
-    except: pass
+        r.raise_for_status()
+        result["price"] = r.json()["ripple"]["usd"]
+    except Exception as e:
+        st.error(f"Price fetch error: {e}")
 
     # Funding rate
     try:
         r = requests.get("https://fapi.binance.com/fapi/v1/premiumIndex",
                          params={"symbol": "XRPUSDT"}, timeout=REQUEST_TIMEOUT)
-        if r.ok:
-            result["funding_now_pct"] = float(r.json()["lastFundingRate"]) * 100
-    except: pass
+        r.raise_for_status()
+        result["funding_now_pct"] = float(r.json()["lastFundingRate"]) * 100
+    except Exception as e:
+        st.error(f"Funding fetch error: {e}")
 
     # Open Interest
     try:
         r = requests.get("https://fapi.binance.com/fapi/v1/openInterest",
                          params={"symbol": "XRPUSDT"}, timeout=REQUEST_TIMEOUT)
-        if r.ok:
-            oi_contracts = float(r.json()["openInterest"])
-            if result["price"]:
-                result["oi_usd"] = oi_contracts * result["price"]
-    except: pass
+        r.raise_for_status()
+        oi_contracts = float(r.json()["openInterest"])
+        if result["price"]:
+            result["oi_usd"] = oi_contracts * result["price"]
+    except Exception as e:
+        st.error(f"Open Interest fetch error: {e}")
 
-    # Funding history (for Z-score)
+    # Funding history
     try:
         r = requests.get("https://fapi.binance.com/fapi/v1/fundingRate",
                          params={"symbol": "XRPUSDT", "limit": 200}, timeout=REQUEST_TIMEOUT)
-        if r.ok:
-            rates = [float(x["fundingRate"]) * 100 for x in r.json()[-90:]]
-            result["funding_hist_pct"] = rates
-    except: pass
+        r.raise_for_status()
+        rates = [float(x["fundingRate"]) * 100 for x in r.json()[-90:]]
+        result["funding_hist_pct"] = rates
+    except Exception as e:
+        st.error(f"Funding history fetch error: {e}")
 
     # Long/Short ratio
     try:
         r = requests.get("https://fapi.binance.com/futures/data/globalLongShortAccountRatio",
                          params={"symbol": "XRPUSDT", "period": "5m", "limit": 1}, timeout=REQUEST_TIMEOUT)
-        if r.ok and r.json():
+        r.raise_for_status()
+        if r.json():
             result["long_short_ratio"] = float(r.json()[0]["longShortRatio"])
-    except: pass
+    except Exception as e:
+        st.error(f"Long/Short ratio fetch error: {e}")
 
-    # === BINANCE SIGNED NETFLOW — NOW WORKS ON RAILWAY SHARED VARS ===
+    # Binance signed netflow
     api_key = os.getenv("BINANCE_API_KEY")
     api_secret = os.getenv("BINANCE_API_SECRET")
-    if api_key and api_secret and api_key.strip() and api_secret.strip():  # ← this was missing!
+    if api_key and api_secret and api_key.strip() and api_secret.strip():
         try:
             ts = int(time.time() * 1000)
-            start = ts - 86_400_000  # 24h
+            start = ts - 86_400_000
             base = "https://api.binance.com"
-
-            # Deposits
             params = {"coin": "XRP", "startTime": start, "timestamp": ts}
             query_string = urlencode(params)
             signature = hmac.new(api_secret.encode(), query_string.encode(), hashlib.sha256).hexdigest()
             dep_url = f"{base}/sapi/v1/capital/deposit/hisrec?{query_string}&signature={signature}"
             dep = requests.get(dep_url, headers={"X-MBX-APIKEY": api_key}, timeout=REQUEST_TIMEOUT).json()
-
-            # Withdrawals
             wd_url = f"{base}/sapi/v1/capital/withdraw/history?{query_string}&signature={signature}"
             wd = requests.get(wd_url, headers={"X-MBX-APIKEY": api_key}, timeout=REQUEST_TIMEOUT).json()
-
             dep_amt = sum(float(d.get("amount", 0)) for d in dep if d.get("status") == 1)
-            wd_amt = sum(float(w.get("amount", 0)) - float(w.get("transactionFee", 0)) 
-                        for w in wd if w.get("status") == 6)
-
+            wd_amt = sum(float(w.get("amount", 0)) - float(w.get("transactionFee", 0)) for w in wd if w.get("status") == 6)
             result["binance_netflow_24h"] = wd_amt - dep_amt
         except Exception as e:
-            st.sidebar.error(f"Binance netflow error: {e}")
+            st.error(f"Binance netflow fetch error: {e}")
 
-    # XRPL whale inflows from Redis
+    # XRPL inflows
     try:
         raw = rdb.get("xrpl:latest_inflows")
         if raw:
             inflows = json.loads(raw) if isinstance(raw, str) else raw
             result["net_whale_flow"] = sum(i.get("xrp", 0) for i in inflows)
-    except: pass
+    except Exception as e:
+        st.error(f"XRPL inflows fetch error: {e}")
 
     return result
 
 live = fetch_live()
+
 
 # ========================= #
 # News sentiment from Redis
@@ -292,6 +285,7 @@ else:
 # Footer
 # ========================= #
 st.caption("v8.5 — Bulletproof chart + Railway shared vars fixed • Running on ↑↑↑")
+
 
 
 
