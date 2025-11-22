@@ -4,3 +4,6 @@ redis
 numpy
 pandas
 plotly
+transformers
+torch
+huggingface_hub
