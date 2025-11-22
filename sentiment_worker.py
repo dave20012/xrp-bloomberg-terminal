@@ -1,4 +1,4 @@
-# sentiment_worker.py
+# sentiment_worker.py — Modified for debugging and robustness
 import time
 import os
 import json
@@ -9,7 +9,6 @@ import numpy as np
 from redis_client import rdb
 import logging
 from datetime import datetime, timezone
-
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 
@@ -24,19 +23,17 @@ _HYPE = re.compile(
     re.IGNORECASE,
 )
 
+# Temporarily relaxed for testing: minimal filtering
 def _reject_headline(t: str) -> bool:
     if not t:
         return True
     t = t.strip()
-    if _HYPE.search(t):
-        return True
-    if len(t.split()) < 5:
-        return True
-    uc_ratio = sum(1 for c in t if c.isupper()) / max(1, len(t))
-    if uc_ratio > 0.35:
-        return True
-    if "XRP" in t.upper() and len(t) < 30:
-        return True
+    # Remove aggressive hype check and length/uppercase restrictions for testing
+    # if _HYPE.search(t): return True
+    # if len(t.split()) < 5: return True
+    # uc_ratio = sum(1 for c in t if c.isupper()) / max(1, len(t))
+    # if uc_ratio > 0.35: return True
+    # if "XRP" in t.upper() and len(t) < 30: return True
     return False
 
 def fetch_headlines(domains=None):
@@ -71,11 +68,10 @@ def finbert_infer(text):
     url = "https://api-inference.huggingface.co/models/ProsusAI/finbert"
     try:
         r = requests.post(url, headers=headers, json={"inputs": text}, timeout=15)
-        if not r.ok:
-            logging.warning(f"FinBERT API returned bad status for text: {text[:30]}...")
-            return None
         resp = r.json()
-        if isinstance(resp, dict) or not resp:
+        logging.info(f"FinBERT response for text '{text[:50]}...': {resp}")  # log raw response
+        if not r.ok or isinstance(resp, dict) or not resp:
+            logging.warning(f"FinBERT API returned bad status for text: {text[:30]}...")
             return None
         d = resp[0]
         if isinstance(d, dict) and "label" in d:
@@ -133,7 +129,11 @@ def run_once():
     scored = []
     scores = []
     for a in to_score:
-        s = finbert_infer(a["title"])
+        try:
+            s = finbert_infer(a["title"])
+        except Exception as e:
+            logging.error(f"FinBERT scoring error for title '{a['title']}': {e}")
+            s = None
         scored.append({"source": a["source"], "title": a["title"], "score": s})
         if s is not None:
             scores.append(s)
@@ -153,5 +153,3 @@ def run_loop():
 
 if __name__ == "__main__":
     run_loop()
-
-
