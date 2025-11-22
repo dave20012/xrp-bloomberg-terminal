@@ -230,7 +230,7 @@ for k, v in points.items():
 st.markdown("**Live Signal Breakdown (raw)**")
 for k, v in {
     "Funding Now (%)": live.get("funding_now_pct"),
-    "Funding Z-Score": round(fund_z: 4f),
+    "Funding Z-Score": round(fund_z, 4),
     "Whale Flow (M)": round(live.get("net_whale_flow") or 0, 3),
     "Binance Netflow 24h": live.get("binance_netflow_24h"),
     "Open Interest $": live.get("oi_usd"),
@@ -284,4 +284,5 @@ else:
 # Footer
 # ========================= #
 st.caption("v8.5 — Bulletproof chart + Railway shared vars fixed • Running on ↑↑↑")
+
 
