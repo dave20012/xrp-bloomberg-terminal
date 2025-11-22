@@ -269,7 +269,7 @@ if not ohlc.empty and not volume.empty:
                       yaxis2=dict(title="Volume (B USD)", domain=[0.0, 0.25], anchor="free", overlaying="y", side="left", position=0),
                       legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1), margin=dict(l=50,r=50,t=50,b=50),
                       hovermode="x unified")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=stretch)
 else:
     st.write("OHLC/volume data unavailable — check CoinGecko or cache.")
 
@@ -277,3 +277,4 @@ else:
 # Footer
 # -------------------------
 st.caption("v8.4 • Hardened build • Market refresh every 45s • News sentiment updated by worker every 30m • XRPL inflows detected by worker")
+
