@@ -12,15 +12,6 @@ from datetime import datetime
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 
-# Example after fetching data
-logging.info(f"Fetched {len(fetched_articles)} articles from news API")
-
-# Example after processing data
-logging.info(f"Processed sentiment for {len(processed_articles)} articles")
-
-# Example before sending to main service
-logging.info(f"Pushing payload: {processed_payload}")
-
 NEWS_KEY = os.getenv("NEWS_API_KEY")
 HF_TOKEN = os.getenv("HF_TOKEN")
 PAGE_SIZE = int(os.getenv("SENTIMENT_PAGE_SIZE", "20"))
@@ -161,3 +152,4 @@ def run_loop():
 
 if __name__ == "__main__":
     run_loop()
+
