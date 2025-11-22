@@ -1,4 +1,4 @@
-# ================= XRP REVERSAL & BREAKOUT ENGINE v10.1 ================= #
+# ================= XRP REVERSAL & BREAKOUT ENGINE v10.2 ================= #
 # World-class XRP-only dashboard:
 # - XRPL Inflows (Redis: xrpl:latest_inflows)
 # - Binance netflow (signed) for XRP
@@ -6,7 +6,11 @@
 # - News sentiment (Redis: news:sentiment)
 # - XRP/BTC & XRP/ETH ratios (flip monitor)
 # - Robust OHLC + volume (CoinGecko + Binance fallback)
-# - Simplified SMA/volume backtest + on-chart signal annotations
+# - SMA/Volume backtest with:
+#   * Trade list
+#   * Win-rate, avg return, max drawdown, Sharpe
+#   * Full 90D equity curve over time
+#   * On-chart signal annotations
 # - Whale inflow table
 # - Basic/Advanced view toggle
 
@@ -36,15 +40,15 @@ BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 # ============================= PAGE SETUP ============================= #
 
 st.set_page_config(
-    page_title="XRP Engine v10.1",
+    page_title="XRP Engine v10.2",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
 
-st.title("XRP REVERSAL & BREAKOUT ENGINE v10.1")
+st.title("XRP REVERSAL & BREAKOUT ENGINE v10.2")
 st.markdown(
     "<p style='text-align:center;color:#00ff88;'>"
-    "XRPL Inflows • Binance Netflow • XRP/BTC & XRP/ETH Ratios • News Sentiment • 90D Backtest"
+    "XRPL Inflows • Binance Netflow • XRP/BTC & XRP/ETH Ratios • News Sentiment • 90D Equity Backtest"
     "</p>",
     unsafe_allow_html=True,
 )
@@ -301,7 +305,6 @@ def fetch_live():
             sig = hmac.new(
                 BINANCE_API_SECRET.encode(), qs.encode(), hashlib.sha256
             ).hexdigest()
-            headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
 
             dep = safe_get(f"{base}/sapi/v1/capital/deposit/hisrec?{qs}&signature={sig}")
             wd = safe_get(f"{base}/sapi/v1/capital/withdraw/history?{qs}&signature={sig}")
@@ -320,14 +323,14 @@ def fetch_live():
                 if wd
                 else 0.0
             )
-            out["binance_netflow_24h"] = wd_amt - dep_amt  # positive = net outflow from Binance
+            # positive = net outflow from Binance
+            out["binance_netflow_24h"] = wd_amt - dep_amt
         except:
             pass
 
     # XRPL inflows (net sum of latest snapshot)
     xrpl_df = load_xrpl_inflows()
     if not xrpl_df.empty:
-        # Convert M XRP back to XRP for scoring scale if needed
         out["xrpl_net_inflow_xrp"] = float(xrpl_df["Amount (M XRP)"].sum() * 1e6)
 
     return out
@@ -379,17 +382,30 @@ def compute_score(live, news):
     return total, pts, fund_z
 
 
-# ============================= SIMPLE SMA BACKTEST ============================= #
+# ============================= SMA BACKTEST + EQUITY CURVE ============================= #
 
 @st.cache_data(ttl=600)
 def compute_backtest(chart_df: pd.DataFrame):
     """
-    Simplified backtest on price only:
-    - SMA(10) crossing above SMA(30)
-    - Volume > 1.2x 10-day average volume
-    Entry: signal day close
-    Exit: 10 bars later (or last bar)
-    Returns metrics + list of signals for annotation.
+    Backtest on 90-day XRP data using a simple but structured strategy:
+    - Signal:
+        * SMA(10) crosses above SMA(30)
+        * AND volume > 1.2x 10-day average
+    - Entry: close on signal bar
+    - Exit: 10 bars later OR last bar
+    - Starting equity: 100 units
+    - Equity curve: updated on exit dates
+    Returns:
+      {
+        "num_trades": int,
+        "win_rate": float,
+        "avg_return": float,
+        "max_drawdown": float,
+        "sharpe": float,
+        "signals": [ {date, price, exit_date, exit_price, ret_pct, entry_idx, exit_idx} ],
+        "equity_dates": [datetime],
+        "equity_curve": [float],
+      }
     """
     df = chart_df.copy()
     if df.empty:
@@ -400,6 +416,8 @@ def compute_backtest(chart_df: pd.DataFrame):
             "max_drawdown": 0.0,
             "sharpe": 0.0,
             "signals": [],
+            "equity_dates": [],
+            "equity_curve": [],
         }
 
     df = df.sort_values("date").reset_index(drop=True)
@@ -408,9 +426,10 @@ def compute_backtest(chart_df: pd.DataFrame):
     df["vol_ma"] = df["volume"].rolling(10).mean()
 
     signals = []
-    rets = []
+    trade_rets = []
 
-    for i in range(31, len(df) - 10):
+    # Identify trades
+    for i in range(31, len(df) - 1):
         prev_fast = df.loc[i - 1, "sma_fast"]
         prev_slow = df.loc[i - 1, "sma_slow"]
         fast = df.loc[i, "sma_fast"]
@@ -424,26 +443,29 @@ def compute_backtest(chart_df: pd.DataFrame):
         if not (cross_up and vol_ok):
             continue
 
-        entry_price = df.loc[i, "close"]
+        entry_idx = i
+        entry_price = df.loc[entry_idx, "close"]
         if entry_price <= 0:
             continue
 
-        exit_idx = min(i + 10, len(df) - 1)
+        exit_idx = min(entry_idx + 10, len(df) - 1)
         exit_price = df.loc[exit_idx, "close"]
         ret_pct = (exit_price / entry_price - 1.0) * 100.0
-        rets.append(ret_pct)
+        trade_rets.append(ret_pct)
 
         signals.append(
             {
-                "date": df.loc[i, "date"],
+                "date": df.loc[entry_idx, "date"],
                 "price": float(entry_price),
                 "exit_date": df.loc[exit_idx, "date"],
                 "exit_price": float(exit_price),
                 "ret_pct": float(ret_pct),
+                "entry_idx": int(entry_idx),
+                "exit_idx": int(exit_idx),
             }
         )
 
-    if not rets:
+    if not trade_rets:
         return {
             "num_trades": 0,
             "win_rate": 0.0,
@@ -451,28 +473,49 @@ def compute_backtest(chart_df: pd.DataFrame):
             "max_drawdown": 0.0,
             "sharpe": 0.0,
             "signals": [],
+            "equity_dates": list(df["date"].values),
+            "equity_curve": [100.0] * len(df),
         }
 
-    rets = np.array(rets)
-    num_trades = len(rets)
-    win_rate = float((rets > 0).sum() / num_trades * 100.0)
-    avg_return = float(rets.mean())
+    trade_rets = np.array(trade_rets)
 
-    eq = np.cumprod(1.0 + rets / 100.0)
+    num_trades = len(trade_rets)
+    win_rate = float((trade_rets > 0).sum() / num_trades * 100.0)
+    avg_return = float(trade_rets.mean())
+
+    # Build equity curve over all dates
+    equity = np.zeros(len(df))
+    equity[0] = 100.0
+    # Map exit_idx -> combined return of all trades exiting that day
+    exits_by_idx = {}
+    for sig in signals:
+        idx = sig["exit_idx"]
+        exits_by_idx.setdefault(idx, 0.0)
+        exits_by_idx[idx] += sig["ret_pct"]
+
+    for i in range(1, len(df)):
+        equity[i] = equity[i - 1]
+        if i in exits_by_idx:
+            equity[i] = equity[i] * (1.0 + exits_by_idx[i] / 100.0)
+
+    # Drawdown & Sharpe on trade returns
+    eq = equity / equity[0]
     peak = np.maximum.accumulate(eq)
-    drawdown = eq / peak - 1.0
-    max_drawdown = float(drawdown.min() * 100.0)
+    dd = eq / peak - 1.0
+    max_drawdown = float(dd.min() * 100.0)
 
-    std = rets.std()
-    sharpe = float((rets.mean() / std) * np.sqrt(num_trades)) if std > 1e-8 else 0.0
+    std = trade_rets.std()
+    sharpe = float((trade_rets.mean() / std) * np.sqrt(num_trades)) if std > 1e-8 else 0.0
 
     return {
         "num_trades": num_trades,
-        "win_rate": win_rate,
-        "avg_return": avg_return,
-        "max_drawdown": max_drawdown,
-        "sharpe": sharpe,
+        "win_rate": float(win_rate),
+        "avg_return": float(avg_return),
+        "max_drawdown": float(max_drawdown),
+        "sharpe": float(sharpe),
         "signals": signals,
+        "equity_dates": list(df["date"].values),
+        "equity_curve": list(equity),
     }
 
 
@@ -554,13 +597,36 @@ if show_advanced:
     b4.metric("Max Drawdown", f"{backtest['max_drawdown']:.1f}%")
     b5.metric("Sharpe (approx)", f"{backtest['sharpe']:.2f}")
 
+    # Equity curve chart
+    st.markdown("#### Backtest Equity Curve (Starting equity = 100)")
+    if backtest["equity_dates"] and backtest["equity_curve"]:
+        eq_fig = go.Figure()
+        eq_fig.add_trace(
+            go.Scatter(
+                x=backtest["equity_dates"],
+                y=backtest["equity_curve"],
+                mode="lines",
+                name="Equity",
+            )
+        )
+        eq_fig.update_layout(
+            height=300,
+            template="plotly_dark",
+            yaxis_title="Equity",
+            xaxis_title="Date",
+            margin=dict(l=40, r=20, t=40, b=40),
+        )
+        st.plotly_chart(eq_fig, use_container_width=True)
+    else:
+        st.info("Not enough data to compute equity curve.")
+
 # ============================= XRPL INFLOWS TABLE ============================= #
 
 if show_advanced:
     st.markdown("### XRPL → Exchange Inflows (Last Snapshot)")
     if not xrpl_table.empty:
         def color_rows(row):
-            if row["Type"].lower() == "deposit":
+            if str(row["Type"]).lower() == "deposit":
                 return ["background-color: #330000"] * len(row)
             return [""] * len(row)
 
@@ -654,6 +720,6 @@ else:
 # ============================= FOOTER ============================= #
 
 st.caption(
-    "v10.1 — XRP-only • XRPL Inflows • Binance Netflow • XRP/BTC & XRP/ETH • "
-    "News Sentiment (cached) • SMA Backtest + Signal Annotations • Robust Fallbacks"
+    "v10.2 — XRP-only • XRPL Inflows • Binance Netflow • XRP/BTC & XRP/ETH • "
+    "News Sentiment (cached) • SMA Backtest + Equity Curve + Signal Annotations • Robust Fallbacks"
 )
