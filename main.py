@@ -22,6 +22,7 @@ REQUEST_TIMEOUT = 10
 
 @st.cache_data(ttl=600)
 def get_chart_data():
+    # 1. CoinGecko
     try:
         r = requests.get(
             "https://api.coingecko.com/api/v3/coins/ripple/market_chart",
@@ -44,6 +45,7 @@ def get_chart_data():
     except Exception as e:
         st.error(f"CoinGecko fetch failed: {e}")
 
+    # 2. Binance fallback
     try:
         r = requests.get(
             "https://api.binance.com/api/v3/klines",
@@ -57,12 +59,14 @@ def get_chart_data():
             "close_time", "quote_vol", "trades", "tb_base", "tb_quote", "ignore"
         ])
         df["date"] = pd.to_datetime(df["open_time"], unit="ms").dt.date
-        df = df.astype({"open": float, "high": float, "low": float, "close": float, "volume": float})
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
         return df[["date", "open", "high", "low", "close", "volume"]]
     except Exception as e:
         st.error(f"Binance fetch failed: {e}")
 
     return pd.DataFrame()
+
 
 def fetch_live():
     result = {
@@ -285,6 +289,7 @@ else:
 # Footer
 # ========================= #
 st.caption("v8.5 — Bulletproof chart + Railway shared vars fixed • Running on ↑↑↑")
+
 
 
 
