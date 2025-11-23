@@ -125,8 +125,7 @@ EXCHANGE_WEIGHTS = {
     "Uphold": 0.70,
     "KuCoin": 0.65,
     "GateIO": 0.60,
-    "bitbank": 0.60,
-    "bitFlyer": 0.60,
+    "Bitbank": 0.60,
     "Coincheck": 0.60,
     "Upbit": 0.75,
     "Bithumb": 0.75,
@@ -162,6 +161,4 @@ RIPPLE_CORP_ADDRESSES = [
     "r3F5NsyiGwVYs2Rs3cCcrVw4t5wZP2ZxRr",
     "r4MoybfgCHDoUByYyMejimaX6a8CEtWtav",
     "rhbWRsNE4v4neB5KvscrwCvcETv7c1vDJf",
-
-    
 ]
