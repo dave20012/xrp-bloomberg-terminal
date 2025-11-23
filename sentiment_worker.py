@@ -1,16 +1,18 @@
-# sentiment_worker.py — SENTIMENT WORKER v10.3
-# Weighted institutional sentiment scoring via FinBERT Router API.
-# Pushes scalar sentiment + components to Redis key: "news:sentiment"
+# ================= SENTIMENT WORKER v10.4 =======================
+# Weighted institutional sentiment scoring via FinBERT Router API
+# Pushes raw per-article scores + aggregate scalar score to Redis: news:sentiment
 
 import os
 import time
 import json
 import random
 import re
-import requests
-import numpy as np
 import logging
 from datetime import datetime, timezone
+
+import numpy as np
+import requests
+
 from redis_client import rdb
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -21,31 +23,9 @@ RUN_INTERVAL = int(os.getenv("SENTIMENT_RUN_INTERVAL", "1800"))  # default 30m
 
 # ===================== Source Weight Map =========================
 
-TIER_1 = [
-    "reuters",
-    "bloomberg",
-    "financial times",
-    "ft",
-    "wsj",
-    "wall street journal",
-    "forbes",
-    "cnbc",
-]
-TIER_2 = [
-    "fortune",
-    "business insider",
-    "marketwatch",
-    "yahoo finance",
-    "tradingview",
-    "markets insider",
-]
-TIER_3 = [
-    "coindesk",
-    "cointelegraph",
-    "cryptoslate",
-    "bitcoinist",
-    "cryptobriefing",
-]
+TIER_1 = ["reuters", "bloomberg", "financial times", "ft", "wsj", "wall street journal", "forbes", "cnbc"]
+TIER_2 = ["fortune", "business insider", "marketwatch", "yahoo finance", "tradingview", "markets insider"]
+TIER_3 = ["coindesk", "cointelegraph", "cryptoslate", "bitcoinist", "cryptobriefing"]
 TABLOID = ["biztoc", "zycrypto", "u.today", "dailyhodl", "ambcrypto"]
 
 
@@ -61,15 +41,12 @@ def source_weight(src: str) -> float:
         return 0.35
     if any(x in s for x in TABLOID):
         return 0.05
-    return 0.15  # default small institutional weight
+    return 0.15
 
 
 # ====================== Headline Filter ==========================
 
-HYPE = re.compile(
-    r"(price|surge|massive|soars|dip|moon|target|prediction|forecast)",
-    re.IGNORECASE,
-)
+HYPE = re.compile(r"(price|surge|massive|soars|dip|moon|target|prediction|forecast)", re.IGNORECASE)
 
 
 def clean_headline(title: str, src: str) -> bool:
@@ -79,7 +56,7 @@ def clean_headline(title: str, src: str) -> bool:
     if len(t.split()) < 4:
         return False
 
-    # allow hype ONLY from Tier-1 / Tier-2
+    # allow hype ONLY from serious sources
     if HYPE.search(t) and source_weight(src) < 0.6:
         return False
 
@@ -106,9 +83,9 @@ def fetch():
             timeout=15,
         )
         if not r.ok:
-            logging.warning(f"News API error: {r.status_code} {r.text[:120]}")
+            logging.warning(f"News API error: {r.status_code}")
             return []
-        return r.json().get("articles", []) or []
+        return r.json().get("articles", [])
     except Exception as e:
         logging.error(f"News fetch failed: {e}")
         return []
@@ -117,14 +94,8 @@ def fetch():
 # ====================== FinBERT Router API =======================
 
 def finbert(text: str):
-    """
-    Call HuggingFace Router with ProsusAI/finbert.
-
-    Returns (pos, neg, neu) or None.
-    """
     if not HF_TOKEN:
         return None
-
     url = "https://router.huggingface.co"
     hdr = {"Authorization": f"Bearer {HF_TOKEN}"}
     payload = {"inputs": text, "model": "ProsusAI/finbert"}
@@ -138,14 +109,15 @@ def finbert(text: str):
 
             resp = r.json()
 
-            # Standard HF router output: [[{label,score},...]]
+            # Standard HF router output
             if isinstance(resp, list) and resp and isinstance(resp[0], list):
                 preds = resp[0]
                 scores = {x["label"]: x["score"] for x in preds}
-                pos = scores.get("positive", 0.0)
-                neg = scores.get("negative", 0.0)
-                neu = scores.get("neutral", 0.0)
-                return pos, neg, neu
+                return (
+                    scores.get("positive", 0.0),
+                    scores.get("negative", 0.0),
+                    scores.get("neutral", 0.0),
+                )
         except Exception as e:
             logging.error(f"FinBERT inference failed: {e}")
             time.sleep(0.5)
@@ -165,16 +137,8 @@ def weighted_trimmed_mean(scores, weights):
 
     idx = arr.argsort()
     k = max(1, int(len(arr) * 0.2))
-    if len(arr) > 2 * k:
-        arr_trim = arr[idx][k:-k]
-        w_trim = w[idx][k:-k]
-    else:
-        arr_trim = arr
-        w_trim = w
-
-    if w_trim.sum() <= 0:
-        return 0.0
-
+    arr_trim = arr[idx][k:-k] if len(arr) > 2 * k else arr
+    w_trim = w[idx][k:-k] if len(w) > 2 * k else w
     return float(np.average(arr_trim, weights=w_trim))
 
 
@@ -195,27 +159,27 @@ def push(payload):
 # ======================= Main Routine =============================
 
 def run_once():
-    articles = fetch()
-    cleaned = []
+    arts = fetch()
+    good = []
 
-    for a in articles:
+    for a in arts:
         src = a.get("source", {}).get("name", "") or ""
         title = (a.get("title") or "").strip()
         if clean_headline(title, src):
-            cleaned.append({"source": src, "title": title})
+            good.append({"source": src, "title": title})
 
-    logging.info(f"Valid headlines: {len(cleaned)}")
+    logging.info(f"Valid headlines: {len(good)}")
 
-    if not cleaned:
+    if not good:
         push({"timestamp": ts(), "score": 0.0, "count": 0, "articles": []})
         return
 
-    random.shuffle(cleaned)
+    random.shuffle(good)
     scored = []
     scalar_scores = []
     weights = []
 
-    for a in cleaned[:16]:
+    for a in good[:16]:
         res = finbert(a["title"])
         w = source_weight(a["source"])
 
@@ -228,8 +192,7 @@ def run_once():
                     "pos": pos,
                     "neg": neg,
                     "neu": neu,
-                    "score": scalar,   # <-- main.py expects "score"
-                    "scalar": scalar,  # legacy / debug
+                    "scalar": scalar,
                     "weight": w,
                 }
             )
@@ -242,7 +205,6 @@ def run_once():
                     "pos": None,
                     "neg": None,
                     "neu": None,
-                    "score": None,
                     "scalar": None,
                     "weight": w,
                 }
@@ -251,14 +213,15 @@ def run_once():
         time.sleep(0.22)
 
     final = weighted_trimmed_mean(scalar_scores, weights)
-    payload = {
-        "timestamp": ts(),
-        "score": final,
-        "count": len(scalar_scores),
-        "mode": "weighted_all",
-        "articles": scored,
-    }
-    push(payload)
+    push(
+        {
+            "timestamp": ts(),
+            "score": final,
+            "count": len(scalar_scores),
+            "mode": "weighted_all",
+            "articles": scored,
+        }
+    )
 
 
 # ======================= Loop ====================================
