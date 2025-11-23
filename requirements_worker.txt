@@ -1,10 +1,4 @@
-numpy==1.26.4
-pandas==2.3.3
-requests==2.31.0
+requests
+numpy
 redis>=5.3.0,<6.0
-transformers==4.57.1
-sentencepiece==0.1.99
-tokenizers==0.13.3
-torch==2.9.1+cpu --index-url https://download.pytorch.org/whl/cpu
 huggingface_hub>=0.26.0
-
