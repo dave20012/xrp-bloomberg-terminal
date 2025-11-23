@@ -27,6 +27,25 @@ MIN_XRP = float(os.getenv("XRPL_MIN_XRP", "10000000"))
 LOOKBACK_SECONDS = int(os.getenv("XRPL_LOOKBACK_SECONDS", str(max(RUN * 2, 900))))
 
 
+def fetch_xrp_usd_price() -> float:
+    """Fetch current XRP/USD price for threshold conversion."""
+    try:
+        resp = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": "ripple", "vs_currencies": "usd"},
+            timeout=10,
+        )
+        if not resp.ok:
+            logging.warning(f"Price API error: {resp.status_code}")
+            return 0.0
+        data = resp.json() or {}
+        xrp = data.get("ripple") or {}
+        return float(xrp.get("usd") or 0.0)
+    except Exception as e:
+        logging.error(f"Failed to fetch XRP price: {e}")
+        return 0.0
+
+
 def owner_from_address(addr: str) -> str:
     """Resolve a deposit address to canonical exchange name using EXCHANGE_ADDRESSES."""
     if not addr:
@@ -48,12 +67,17 @@ def fetch_transactions_whale_alert() -> List[Dict]:
         logging.warning("WHALE_ALERT_KEY missing.")
         return []
 
+    price_usd = fetch_xrp_usd_price()
+    if price_usd <= 0:
+        logging.warning("XRP/USD price unavailable; using raw XRPL_MIN_XRP as USD for Whale Alert threshold")
+    min_value_usd = MIN_XRP * price_usd if price_usd > 0 else MIN_XRP
+
     try:
         r = requests.get(
             WHALE_ALERT_API,
             params={
                 "currency": "xrp",
-                "min_value": MIN_XRP,
+                "min_value": min_value_usd,
                 "limit": 50,
                 "api_key": WHALE_ALERT_KEY,
             },
