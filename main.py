@@ -1,6 +1,10 @@
-# main.py — XRP REVERSAL & BREAKOUT ENGINE v9.0
-# XRP-only, XRPL inflows, Binance netflow, XRP/BTC & XRP/ETH,
-# sentiment EMA + bull/bear, SMA backtest, Redis workers.
+# main.py — XRP REVERSAL & BREAKOUT ENGINE v9.1
+# XRP-only dashboard with:
+# - XRPL inflow weighting by exchange jurisdiction
+# - Binance netflow
+# - XRP/BTC & XRP/ETH ratios + flippening-flow signal
+# - Sentiment EMA + bull/bear decomposition (FinBERT via Router)
+# - SMA backtest + annotated signals on 90d chart
 
 import os
 import hmac
@@ -9,37 +13,72 @@ import time
 from datetime import datetime
 from urllib.parse import urlencode
 
-import streamlit as st
-import pandas as pd
-import numpy as np
-import requests
-import plotly.graph_objects as go
 import json
+import requests
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
 from redis_client import rdb  # Redis client wrapper
 
 # =========================
 # Config / constants
 # =========================
-st.set_page_config(
-    page_title="XRP Engine v9.0",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
-st.title("XRP REVERSAL & BREAKOUT ENGINE v9.0")
+
+st.set_page_config(page_title="XRP Engine v9.1", layout="wide", initial_sidebar_state="collapsed")
+st.title("XRP REVERSAL & BREAKOUT ENGINE v9.1")
 st.markdown(
     "<p style='text-align: center; color: #00ff88; font-size:18px;'>"
-    "XRPL Inflows • Binance Netflow • XRP/BTC & XRP/ETH • News Sentiment • SMA Backtest"
+    "XRPL Inflows (Weighted) • Binance Netflow • XRP/BTC & XRP/ETH Flippening • News Sentiment EMA • SMA Backtest"
     "</p>",
     unsafe_allow_html=True,
 )
 
 META_REFRESH_SECONDS = int(os.getenv("META_REFRESH_SECONDS", "45"))
-st.markdown(
-    f'<meta http-equiv="refresh" content="{META_REFRESH_SECONDS}">', unsafe_allow_html=True
-)
+st.markdown(f"<meta http-equiv='refresh' content='{META_REFRESH_SECONDS}'>", unsafe_allow_html=True)
 
 REQUEST_TIMEOUT = 10
 SENTIMENT_EMA_ALPHA = float(os.getenv("SENTIMENT_EMA_ALPHA", "0.3"))
+
+# Whale OTC (Ripple → Exchange) wallet set (approximate known Ripple wallets)
+RIPPLE_WALLETS = {
+    "rPVMhWBsfF9iMXYj3aAzJVkPDTFNSyWdKy",  # Ripple OTC / institutional
+    "rHLEki8gPuc3sxg8G7kSJDe55hkRdhQWg3",
+    "rEb8TK3gBgk5auZkwc6sHnwrGVJH8DuaLh",  # shared pool, used by Ripple/others
+}
+
+# Exchange jurisdiction weights for XRPL inflow scoring
+EXCHANGE_JURISDICTION_WEIGHT = {
+    "binance": 0.7,
+    "coinbase": 1.0,
+    "kraken": 1.0,
+    "bitstamp": 0.9,
+    "upbit": 0.6,
+    "bithumb": 0.6,
+    "coinone": 0.6,
+    "korbit": 0.6,
+    "bitbank": 0.7,
+    "liquid": 0.6,
+    "sbi": 0.9,
+    "huobi": 0.4,
+    "okx": 0.5,
+    "kucoin": 0.4,
+    "gateio": 0.4,
+    "gemini": 1.0,
+    "bitfinex": 0.7,
+    "bittrex": 0.8,
+}
+
+
+def jurisdiction_weight(exchange_name: str) -> float:
+    if not exchange_name:
+        return 0.5
+    s = exchange_name.lower()
+    for key, w in EXCHANGE_JURISDICTION_WEIGHT.items():
+        if key in s:
+            return w
+    return 0.5
 
 
 # =========================
@@ -57,18 +96,66 @@ def safe_get(url, params=None, timeout=REQUEST_TIMEOUT):
 
 
 # =========================
+# Ratio baselines (for flippening)
+# =========================
+
+@st.cache_data(ttl=1800)
+def get_ratio_baselines():
+    """
+    Compute 30d average XRP/BTC and XRP/ETH ratios using CoinGecko prices.
+    Used for 'Flippening Flow' detection.
+    """
+    try:
+        xrp_mc = safe_get(
+            "https://api.coingecko.com/api/v3/coins/ripple/market_chart",
+            {"vs_currency": "usd", "days": "30"},
+        )
+        btc_mc = safe_get(
+            "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart",
+            {"vs_currency": "usd", "days": "30"},
+        )
+        eth_mc = safe_get(
+            "https://api.coingecko.com/api/v3/coins/ethereum/market_chart",
+            {"vs_currency": "usd", "days": "30"},
+        )
+        if not xrp_mc or not btc_mc or not eth_mc:
+            return None, None
+
+        xrp_prices = pd.DataFrame(xrp_mc["prices"], columns=["ts", "px"])
+        btc_prices = pd.DataFrame(btc_mc["prices"], columns=["ts", "px"])
+        eth_prices = pd.DataFrame(eth_mc["prices"], columns=["ts", "px"])
+
+        # align by index length (rough but adequate)
+        n = min(len(xrp_prices), len(btc_prices), len(eth_prices))
+        xrp = xrp_prices["px"].iloc[:n].values
+        btc = btc_prices["px"].iloc[:n].values
+        eth = eth_prices["px"].iloc[:n].values
+
+        btc[btc <= 0] = np.nan
+        eth[eth <= 0] = np.nan
+
+        ratio_xrp_btc = xrp / btc
+        ratio_xrp_eth = xrp / eth
+
+        baseline_btc = float(np.nanmean(ratio_xrp_btc))
+        baseline_eth = float(np.nanmean(ratio_xrp_eth))
+        return baseline_btc, baseline_eth
+    except Exception:
+        return None, None
+
+
+# =========================
 # Chart data (90d OHLC + volume)
 # =========================
 
 @st.cache_data(ttl=600)
 def get_chart_data():
     """
-    Correct 90-day daily OHLC + Volume.
-    - Uses CoinGecko OHLC for candles
-    - Uses market_chart for volume
+    Correct 90-day daily OHLC + Volume
+    - Uses CoinGecko OHLC endpoint for candles
+    - Uses market_chart only for volume
     - Falls back to Binance klines if needed
     """
-    # 1) CoinGecko
     ohlc = safe_get(
         "https://api.coingecko.com/api/v3/coins/ripple/ohlc",
         {"vs_currency": "usd", "days": "90"},
@@ -87,13 +174,13 @@ def get_chart_data():
             vol_df["date"] = pd.to_datetime(vol_df["ts"], unit="ms")
 
             df = pd.merge(ohlc_df, vol_df[["date", "volume"]], on="date", how="left")
-            df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
+            df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
             df = df.sort_values("date")
             return df[["date", "open", "high", "low", "close", "volume"]]
         except Exception:
             pass
 
-    # 2) Binance fallback
+    # Binance fallback
     kl = safe_get(
         "https://api.binance.com/api/v3/klines",
         {"symbol": "XRPUSDT", "interval": "1d", "limit": 90},
@@ -119,7 +206,7 @@ def get_chart_data():
             )
             df["date"] = pd.to_datetime(df["open_time"], unit="ms")
             for col in ["open", "high", "low", "close", "volume"]:
-                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+                df[col] = pd.to_numeric(df[col], errors="coerce")
             df = df.sort_values("date")
             return df[["date", "open", "high", "low", "close", "volume"]]
         except Exception:
@@ -140,38 +227,29 @@ def fetch_live():
         "oi_usd": None,
         "long_short_ratio": 1.0,
         "binance_netflow_24h": 0.0,
-        "net_whale_flow": 0.0,
         "xrp_btc": None,
         "xrp_eth": None,
+        "xrpl_net_inflow_raw": 0.0,
+        "xrpl_net_inflow_weighted": 0.0,
+        "ripple_otc_to_exchanges": 0.0,
     }
 
-    # Price
+    # Price + ratios
     try:
         r = requests.get(
             "https://api.coingecko.com/api/v3/simple/price",
-            params={"ids": "ripple", "vs_currencies": "usd"},
-            timeout=REQUEST_TIMEOUT,
-        )
-        if r.ok:
-            result["price"] = float(r.json()["ripple"]["usd"])
-    except Exception:
-        pass
-
-    # XRP/BTC, XRP/ETH ratios
-    try:
-        r = requests.get(
-            "https://api.coingecko.com/api/v3/simple/price",
-            params={
-                "ids": "ripple,bitcoin,ethereum",
-                "vs_currencies": "usd",
-            },
+            params={"ids": "ripple,bitcoin,ethereum", "vs_currencies": "usd"},
             timeout=REQUEST_TIMEOUT,
         )
         if r.ok:
             data = r.json()
-            px_xrp = float(data.get("ripple", {}).get("usd", result["price"] or 0.0) or 0.0)
-            px_btc = float(data.get("bitcoin", {}).get("usd", 0.0) or 0.0)
-            px_eth = float(data.get("ethereum", {}).get("usd", 0.0) or 0.0)
+            xrp = data.get("ripple", {})
+            btc = data.get("bitcoin", {})
+            eth = data.get("ethereum", {})
+            px_xrp = float(xrp.get("usd", 0.0) or 0.0)
+            px_btc = float(btc.get("usd", 0.0) or 0.0)
+            px_eth = float(eth.get("usd", 0.0) or 0.0)
+            result["price"] = px_xrp
             if px_btc > 0:
                 result["xrp_btc"] = px_xrp / px_btc
             if px_eth > 0:
@@ -187,7 +265,7 @@ def fetch_live():
             timeout=REQUEST_TIMEOUT,
         )
         if r.ok:
-            result["funding_now_pct"] = float(r.json()["lastFundingRate"]) * 100.0
+            result["funding_now_pct"] = float(r.json()["lastFundingRate"]) * 100
     except Exception:
         pass
 
@@ -213,7 +291,7 @@ def fetch_live():
             timeout=REQUEST_TIMEOUT,
         )
         if r.ok:
-            rates = [float(x["fundingRate"]) * 100.0 for x in r.json()[-90:]]
+            rates = [float(x["fundingRate"]) * 100 for x in r.json()[-90:]]
             result["funding_hist_pct"] = rates
     except Exception:
         pass
@@ -230,7 +308,7 @@ def fetch_live():
     except Exception:
         pass
 
-    # Binance signed netflow
+    # Binance signed netflow (XRP deposits/withdrawals)
     api_key = os.getenv("BINANCE_API_KEY")
     api_secret = os.getenv("BINANCE_API_SECRET")
     if api_key and api_secret and api_key.strip() and api_secret.strip():
@@ -238,11 +316,13 @@ def fetch_live():
             ts = int(time.time() * 1000)
             start = ts - 86_400_000  # 24h
             base = "https://api.binance.com"
+
             params = {"coin": "XRP", "startTime": start, "timestamp": ts}
             query_string = urlencode(params)
             signature = hmac.new(
                 api_secret.encode(), query_string.encode(), hashlib.sha256
             ).hexdigest()
+
             headers = {"X-MBX-APIKEY": api_key}
 
             dep_url = f"{base}/sapi/v1/capital/deposit/hisrec?{query_string}&signature={signature}"
@@ -257,21 +337,44 @@ def fetch_live():
                 for w in wd
                 if w.get("status") == 6
             )
-
             result["binance_netflow_24h"] = wd_amt - dep_amt
         except Exception:
             pass
 
-    # XRPL inflows (Redis snapshot)
+    # XRPL inflows (from Redis)
     try:
         raw = rdb.get("xrpl:latest_inflows")
         if raw:
             if isinstance(raw, bytes):
                 raw = raw.decode("utf-8")
             inflows = json.loads(raw)
-            result["net_whale_flow"] = sum(float(i.get("xrp", 0.0)) for i in inflows)
+        else:
+            inflows = []
     except Exception:
-        pass
+        inflows = []
+
+    # Compute raw inflow, weighted inflow, and Ripple OTC → exchange
+    net_raw = 0.0
+    net_weighted = 0.0
+    ripple_otc = 0.0
+
+    for f in inflows:
+        try:
+            amt = float(f.get("xrp", 0.0))
+        except Exception:
+            amt = 0.0
+        ex_name = f.get("exchange", "") or ""
+        w = jurisdiction_weight(ex_name)
+        net_raw += amt
+        net_weighted += amt * w
+
+        from_addr = f.get("from_address")
+        if from_addr in RIPPLE_WALLETS:
+            ripple_otc += amt
+
+    result["xrpl_net_inflow_raw"] = net_raw
+    result["xrpl_net_inflow_weighted"] = net_weighted
+    result["ripple_otc_to_exchanges"] = ripple_otc
 
     return result
 
@@ -320,16 +423,17 @@ def write_sentiment_ema(value: float):
 
 def compute_sentiment_components(articles, mode: str):
     """
-    Return (instant_sentiment_scalar, bull_intensity, bear_intensity)
-    based on per-article pos/neg and weights.
+    Uses per-article FinBERT outputs (pos, neg, neu, weight) from sentiment_worker.
+    Returns (instant_scalar, bull_intensity, bear_intensity).
     """
     usable = []
     for a in articles:
-        s = a.get("score")
+        pos = a.get("pos")
+        neg = a.get("neg")
         w = a.get("weight", 0.0)
-        if s is None or not isinstance(w, (int, float)):
+        if pos is None or neg is None:
             continue
-        if mode == "Institutional Only" and w < 0.6:
+        if mode == "Institutional Only" and (not isinstance(w, (int, float)) or w < 0.6):
             continue
         usable.append(a)
 
@@ -363,9 +467,7 @@ sent_mode = st.radio(
     horizontal=True,
 )
 
-inst_sent, bull_intensity, bear_intensity = compute_sentiment_components(
-    articles, sent_mode
-)
+inst_sent, bull_intensity, bear_intensity = compute_sentiment_components(articles, sent_mode)
 
 prev_ema = read_sentiment_ema()
 if prev_ema is None:
@@ -375,18 +477,56 @@ else:
 write_sentiment_ema(ema_sent)
 
 # =========================
+# Flippening Flow Detection
+# =========================
+
+baseline_xrp_btc, baseline_xrp_eth = get_ratio_baselines()
+
+def compute_flippening_score(live_data):
+    cur_btc = live_data.get("xrp_btc")
+    cur_eth = live_data.get("xrp_eth")
+    net_inflow = live_data.get("xrpl_net_inflow_weighted", 0.0)
+
+    if not cur_btc or not baseline_xrp_btc or baseline_xrp_btc <= 0:
+        uplift_btc = 0.0
+    else:
+        uplift_btc = (cur_btc / baseline_xrp_btc) - 1.0
+
+    if not cur_eth or not baseline_xrp_eth or baseline_xrp_eth <= 0:
+        uplift_eth = 0.0
+    else:
+        uplift_eth = (cur_eth / baseline_xrp_eth) - 1.0
+
+    # only positive uplift matters for flippening
+    uplift = max(uplift_btc, uplift_eth, 0.0)
+
+    # net inflow in millions, weighted by jurisdiction
+    inflow_m = net_inflow / 1e6
+
+    if uplift <= 0 or inflow_m <= 0:
+        return 0.0, uplift_btc, uplift_eth
+
+    # scale: 0–20 points roughly; more if both uplift and inflow strong
+    score = min(20.0, uplift * 100.0 * min(1.0, inflow_m / 50.0))
+    return float(score), float(uplift_btc), float(uplift_eth)
+
+
+flip_score, uplift_btc, uplift_eth = compute_flippening_score(live)
+
+# =========================
 # Scoring engine
 # =========================
 
 fund_hist = live.get("funding_hist_pct") or [0.0]
 fund_now = live.get("funding_now_pct") or 0.0
-fund_z = (fund_now - np.mean(fund_hist)) / (
-    np.std(fund_hist) if np.std(fund_hist) > 1e-8 else 1e-8
-)
+fund_z = (fund_now - np.mean(fund_hist)) / (np.std(fund_hist) if np.std(fund_hist) > 1e-8 else 1e-8)
 
 points = {
     "Funding Z-Score": max(0.0, fund_z * 22.0),
-    "Whale Flow (XRPL)": max(0.0, (live.get("net_whale_flow") or 0.0) / 60e6 * 14.0),
+    # Use weighted XRPL inflows (jurisdiction-adjusted)
+    "Whale Flow (XRPL, weighted)": max(
+        0.0, (live.get("xrpl_net_inflow_weighted") or 0.0) / 60e6 * 14.0
+    ),
     "Price < $2.45": 28.0 if (live.get("price") or 0.0) < 2.45 else 0.0,
     "OI > $2.7B": 16.0 if (live.get("oi_usd") or 0.0) > 2.7e9 else 0.0,
     "Binance Netflow Bullish": max(
@@ -395,7 +535,8 @@ points = {
     "Short Squeeze Setup": max(
         0.0, (2.0 - live.get("long_short_ratio", 1.0)) * 20.0
     ),
-    "Positive News": 15.0 if ema_sent > 0.2 else 0.0,
+    "Positive News (EMA)": 15.0 if ema_sent > 0.2 else 0.0,
+    "Flippening Flow": flip_score,  # new component
 }
 total_score = float(min(100.0, sum(points.values())))
 
@@ -416,14 +557,18 @@ c5.metric("OI (USD)", f"${(live.get('oi_usd') or 0.0)/1e9:.2f}B")
 c6.metric("L/S Ratio", f"{live.get('long_short_ratio', 1.0):.2f}")
 
 st.markdown("### Sentiment & Flow")
-s1, s2, s3, s4 = st.columns(4)
+s1, s2, s3, s4, s5 = st.columns(5)
 label = "Inst. Sentiment EMA" if sent_mode == "Institutional Only" else "News Sentiment EMA"
 s1.metric(label, f"{ema_sent:+.3f}", delta=f"{inst_sent:+.3f} now")
 s2.metric("Bullish Intensity", f"{bull_intensity:+.3f}")
 s3.metric("Bearish Intensity", f"{bear_intensity:+.3f}")
 s4.metric(
-    "XRPL Inflows (M XRP)",
-    f"{(live.get('net_whale_flow') or 0.0)/1e6:+.1f}",
+    "XRPL Inflows (raw, M XRP)",
+    f"{(live.get('xrpl_net_inflow_raw') or 0.0)/1e6:+.1f}",
+)
+s5.metric(
+    "Ripple OTC → Exchanges (M XRP)",
+    f"{(live.get('ripple_otc_to_exchanges') or 0.0)/1e6:+.1f}",
 )
 
 # Score
@@ -438,15 +583,19 @@ with score_col:
     else:
         color, signal = "#444444", "NEUTRAL — WAIT"
     st.markdown(
-        f'<p style="font-size:86px;color:{color};text-align:center;font-weight:bold;">{total_score:.0f}</p>',
+        f"<p style='font-size:86px;color:{color};text-align:center;font-weight:bold;'>{total_score:.0f}</p>",
         unsafe_allow_html=True,
     )
+
 with signal_col:
     st.markdown(
-        f'<h2 style="color:{color};margin-top:30px;">{signal}</h2>',
+        f"<h2 style='color:{color};margin-top:30px;'>{signal}</h2>",
         unsafe_allow_html=True,
     )
     st.write(f"Funding Z-Score: {fund_z:+.2f}")
+    st.write(f"Flippening Flow Score: {flip_score:.2f}")
+    st.write(f"XRP/BTC uplift vs 30d: {uplift_btc*100:+.2f}%")
+    st.write(f"XRP/ETH uplift vs 30d: {uplift_eth*100:+.2f}%")
 
 st.write("**Score breakdown**")
 for k, v in points.items():
@@ -460,7 +609,9 @@ st.markdown("**Live Signal Breakdown (raw)**")
 raw_items = {
     "Funding Now (%)": live.get("funding_now_pct"),
     "Funding Z-Score": round(fund_z, 4),
-    "XRPL Net Inflow (M XRP)": (live.get("net_whale_flow") or 0.0) / 1e6,
+    "XRPL Net Inflow (raw, M XRP)": (live.get("xrpl_net_inflow_raw") or 0.0) / 1e6,
+    "XRPL Net Inflow (weighted, M XRP)": (live.get("xrpl_net_inflow_weighted") or 0.0) / 1e6,
+    "Ripple OTC → Exchanges (M XRP)": (live.get("ripple_otc_to_exchanges") or 0.0) / 1e6,
     "Binance Netflow 24h (XRP)": live.get("binance_netflow_24h"),
     "Open Interest $": live.get("oi_usd") or 0.0,
     "L/S Ratio": live.get("long_short_ratio"),
@@ -469,11 +620,12 @@ raw_items = {
     "Bullish Intensity": bull_intensity,
     "Bearish Intensity": bear_intensity,
     "News Count": news_payload.get("count", 0),
+    "Flippening Score": flip_score,
 }
 for k, v in raw_items.items():
     a, b = st.columns([3, 1])
     a.write(k)
-    b.write("0" if v == 0 else str(v))
+    b.write("0" if v is None else str(v))
 
 # =========================
 # Simple SMA Backtest on Price
@@ -493,11 +645,9 @@ def run_sma_backtest(df: pd.DataFrame, fast: int = 7, slow: int = 21):
             "sharpe": 0.0,
             "equity": pd.Series(dtype=float),
             "signals": [],
-            "df": df,
         }
-
     df = df.copy().sort_values("date")
-    df["close"] = pd.to_numeric(df["close"], errors="coerce").fillna(0.0)
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
     df["sma_fast"] = df["close"].rolling(fast).mean()
     df["sma_slow"] = df["close"].rolling(slow).mean()
 
@@ -505,14 +655,18 @@ def run_sma_backtest(df: pd.DataFrame, fast: int = 7, slow: int = 21):
     df.loc[df["sma_fast"] > df["sma_slow"], "signal"] = 1
     df["signal_shift"] = df["signal"].shift(1).fillna(0)
 
+    # daily returns
     df["ret"] = df["close"].pct_change().fillna(0.0)
     df["strategy_ret"] = df["ret"] * df["signal_shift"]
 
+    # equity curve
     equity = (1.0 + df["strategy_ret"]).cumprod() * 100.0
 
+    # trades
     entries = df[(df["signal_shift"] == 0) & (df["signal"] == 1)].index
     exits = df[(df["signal_shift"] == 1) & (df["signal"] == 0)].index
 
+    # close open trade at end
     if len(entries) > len(exits) and len(entries) > 0:
         exits = exits.append(pd.Index([df.index[-1]]))
 
@@ -521,7 +675,7 @@ def run_sma_backtest(df: pd.DataFrame, fast: int = 7, slow: int = 21):
     for ent, ex in zip(entries, exits):
         p_ent = df.loc[ent, "close"]
         p_ex = df.loc[ex, "close"]
-        if p_ent > 0 and p_ex > 0:
+        if p_ent and p_ex and p_ent > 0:
             r = (p_ex / p_ent - 1.0) * 100.0
             trade_returns.append(r)
             signals.append(
@@ -573,6 +727,7 @@ m3.metric("Avg Return / Trade", f"{bt['avg_return']:+.1f}%")
 m4.metric("Max Drawdown", f"{bt['max_drawdown']:+.1f}%")
 m5.metric("Sharpe (approx)", f"{bt['sharpe']:.2f}")
 
+# Equity curve
 if not bt["equity"].empty:
     eq_fig = go.Figure()
     eq_fig.add_trace(
@@ -610,24 +765,14 @@ except Exception:
 if inflows:
     xrpl_df = pd.DataFrame(inflows)
     xrpl_df_display = xrpl_df.copy()
-
     if "xrp" in xrpl_df_display.columns:
         xrpl_df_display["xrp_m"] = xrpl_df_display["xrp"].astype(float) / 1e6
     if "timestamp" in xrpl_df_display.columns:
         xrpl_df_display["timestamp"] = xrpl_df_display["timestamp"].astype(str)
-
     cols = []
-    if "timestamp" in xrpl_df_display.columns:
-        cols.append("timestamp")
-    if "exchange" in xrpl_df_display.columns:
-        cols.append("exchange")
-    if "xrp_m" in xrpl_df_display.columns:
-        cols.append("xrp_m")
-    if "from" in xrpl_df_display.columns:
-        cols.append("from")
-    if "destination" in xrpl_df_display.columns:
-        cols.append("destination")
-
+    for c in ["timestamp", "exchange", "xrp_m", "from", "from_address", "to_address", "txid"]:
+        if c in xrpl_df_display.columns:
+            cols.append(c)
     st.dataframe(xrpl_df_display[cols], hide_index=True)
 else:
     st.info("No recent XRPL inflows snapshot found.")
@@ -712,6 +857,6 @@ else:
 # =========================
 
 st.caption(
-    "v9.0 — XRP only • XRPL Inflows • Binance Netflow • XRP/BTC & XRP/ETH • "
-    "News Sentiment (EMA + Bull/Bear) • SMA Backtest + Signal Annotations"
+    "v9.1 — XRP only • XRPL Inflows (Jurisdiction-Weighted) • Binance Netflow • "
+    "XRP/BTC & XRP/ETH Flippening • News Sentiment (EMA + Bull/Bear) • SMA Backtest + Signal Annotations"
 )
