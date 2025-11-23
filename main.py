@@ -165,6 +165,16 @@ def write_ratio_ema(name: str, value: float):
 # =========================
 
 def fetch_live():
+    """Collect all live signals needed by the dashboard.
+
+    Features pulled:
+    - Price (CoinGecko with Redis fallback)
+    - Cross-asset ratios (XRP/BTC, XRP/ETH)
+    - Binance funding (current + history) and open interest
+    - Binance long/short ratio (5m window)
+    - Binance signed netflows (XRP) using API keys when provided
+    - XRPL inflows (raw/weighted) and Ripple OTC flows from Redis
+    """
     result = {
         "price": None,
         "funding_now_pct": 0.0,
