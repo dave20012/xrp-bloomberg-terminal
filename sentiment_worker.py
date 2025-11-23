@@ -1,6 +1,30 @@
-# ================= SENTIMENT WORKER v10.4 =======================
-# Weighted institutional sentiment for XRP via FinBERT on HF router.
-# Pushes raw per-article scores + aggregate scalar to Redis "news:sentiment".
+# ================= SENTIMENT WORKER v9.3 ======================= #
+# Weighted institutional sentiment scoring via HF Inference Providers
+# (HTTP router + hf-inference endpoint, no huggingface_hub dependency).
+#
+# - Fetch headlines for XRP/Ripple
+# - Filter out hype / junk
+# - Run FinBERT classification via:
+#     POST https://router.huggingface.co/hf-inference/models/ProsusAI/finbert
+# - Store:
+#     {
+#       "timestamp": ...,
+#       "score": scalar_weighted_trimmed_mean,
+#       "count": N_valid,
+#       "mode": "weighted_all",
+#       "articles": [
+#           {
+#               "source": ...,
+#               "title": ...,
+#               "pos": float | None,
+#               "neg": float | None,
+#               "neu": float | None,
+#               "scalar": float | None,
+#               "weight": float
+#           }, ...
+#       ]
+#     }
+# in Redis under key "news:sentiment"
 
 import os
 import time
@@ -8,33 +32,40 @@ import json
 import random
 import re
 import logging
+from datetime import datetime, timezone
 
 import numpy as np
 import requests
-from datetime import datetime, timezone
 
 from redis_client import rdb
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
-NEWS_KEY     = os.getenv("NEWS_API_KEY")
-HF_TOKEN     = os.getenv("HF_TOKEN")
+NEWS_KEY = os.getenv("NEWS_API_KEY")
+HF_TOKEN = os.getenv("HF_TOKEN")
 RUN_INTERVAL = int(os.getenv("SENTIMENT_RUN_INTERVAL", "1800"))  # 30m default
 
 # ===================== Source Weight Map =========================
 
 TIER_1 = [
-    "reuters", "bloomberg", "financial times", "ft",
-    "wsj", "wall street journal", "forbes", "cnbc"
+    "reuters",
+    "bloomberg",
+    "financial times",
+    "ft",
+    "wsj",
+    "wall street journal",
+    "forbes",
+    "cnbc",
 ]
 TIER_2 = [
-    "fortune", "business insider", "marketwatch", "yahoo finance",
-    "tradingview", "markets insider", "barron"
+    "fortune",
+    "business insider",
+    "marketwatch",
+    "yahoo finance",
+    "tradingview",
+    "markets insider",
 ]
-TIER_3 = [
-    "coindesk", "cointelegraph", "cryptoslate", "bitcoinist",
-    "cryptobriefing", "decrypt", "newsbtc"
-]
+TIER_3 = ["coindesk", "cointelegraph", "cryptoslate", "bitcoinist", "cryptobriefing"]
 TABLOID = ["biztoc", "zycrypto", "u.today", "dailyhodl", "ambcrypto"]
 
 
@@ -56,8 +87,7 @@ def source_weight(src: str) -> float:
 # ====================== Headline Filter ==========================
 
 HYPE = re.compile(
-    r"(price|surge|massive|soars|plunge|crash|dip|moon|target|prediction|forecast|"
-    r"to \$\d+|100x|1000x|explode)",
+    r"(price|surge|massive|soars|dip|moon|target|prediction|forecast)",
     re.IGNORECASE,
 )
 
@@ -69,7 +99,7 @@ def clean_headline(title: str, src: str) -> bool:
     if len(t.split()) < 4:
         return False
 
-    # Allow hype only from higher-quality sources
+    # allow hype ONLY from Tier-1 & Tier-2 sources
     if HYPE.search(t) and source_weight(src) < 0.6:
         return False
 
@@ -78,11 +108,10 @@ def clean_headline(title: str, src: str) -> bool:
 
 # ===================== Fetch Headlines ===========================
 
-def fetch():
+def fetch_headlines():
     if not NEWS_KEY:
-        logging.warning("NEWS_API_KEY missing; sentiment worker idle.")
+        logging.warning("NEWS_API_KEY missing.")
         return []
-
     try:
         r = requests.get(
             "https://newsapi.org/v2/everything",
@@ -99,7 +128,7 @@ def fetch():
         if not r.ok:
             logging.warning(f"News API error: {r.status_code} {r.text[:120]}")
             return []
-        return r.json().get("articles", []) or []
+        return r.json().get("articles", [])
     except Exception as e:
         logging.error(f"News fetch failed: {e}")
         return []
@@ -107,48 +136,51 @@ def fetch():
 
 # ====================== FinBERT via HF Router ====================
 
-FINBERT_URL = "https://router.huggingface.co/hf-inference/models/ProsusAI/finbert"
-
-
 def finbert(text: str):
     """
-    Call FinBERT text-classification via HF router.
-    Returns (pos, neg, neu) or None.
+    Call HF Inference Providers for FinBERT sentiment.
+
+    Endpoint: https://router.huggingface.co/hf-inference/models/ProsusAI/finbert
+    Payload:  {"inputs": "..."}
+    Expected output: list of { "label": "...", "score": float } or [[...]].
     """
     if not HF_TOKEN:
         return None
 
+    url = "https://router.huggingface.co/hf-inference/models/ProsusAI/finbert"
     headers = {"Authorization": f"Bearer {HF_TOKEN}"}
     payload = {"inputs": text}
 
-    for _ in range(2):  # simple retry
+    for _ in range(2):  # one retry
         try:
-            r = requests.post(FINBERT_URL, headers=headers, json=payload, timeout=25)
+            r = requests.post(url, headers=headers, json=payload, timeout=30)
             if not r.ok:
-                logging.warning(f"FinBERT error {r.status_code}: {r.text[:100]}")
-                time.sleep(0.4)
+                logging.warning(f"FinBERT error {r.status_code}: {r.text[:120]}")
+                time.sleep(0.5)
                 continue
 
             resp = r.json()
 
-            # handle both [ [ {label,score} ] ] and [ {label,score} ] formats
+            # Possible shapes:
+            # 1) [ {label, score}, ... ]
+            # 2) [ [ {label, score}, ... ] ]
             if isinstance(resp, list) and resp:
-                if isinstance(resp[0], list):
-                    arr = resp[0]
+                if isinstance(resp[0], dict):
+                    preds = resp
+                elif isinstance(resp[0], list) and resp[0]:
+                    preds = resp[0]
                 else:
-                    arr = resp
+                    logging.warning(f"Unexpected FinBERT shape: {type(resp[0])}")
+                    return None
+            else:
+                logging.warning("Empty or non-list FinBERT response")
+                return None
 
-                scores = {}
-                for item in arr:
-                    if isinstance(item, dict):
-                        lab = str(item.get("label", "")).lower()
-                        val = float(item.get("score", 0.0) or 0.0)
-                        scores[lab] = val
-
-                pos = float(scores.get("positive", 0.0))
-                neg = float(scores.get("negative", 0.0))
-                neu = float(scores.get("neutral", 0.0))
-                return pos, neg, neu
+            scores = {x["label"].lower(): float(x["score"]) for x in preds if "label" in x}
+            pos = scores.get("positive", 0.0)
+            neg = scores.get("negative", 0.0)
+            neu = scores.get("neutral", 0.0)
+            return pos, neg, neu
 
         except Exception as e:
             logging.error(f"FinBERT inference failed: {e}")
@@ -168,14 +200,9 @@ def weighted_trimmed_mean(scores, weights):
         return 0.0
 
     idx = arr.argsort()
-    k = max(1, int(len(arr) * 0.2))
-    if len(arr) > 2 * k:
-        arr_trim = arr[idx][k:-k]
-        w_trim = w[idx][k:-k]
-    else:
-        arr_trim = arr
-        w_trim = w
-
+    k = max(1, int(len(arr) * 0.2))  # 20% trim
+    arr_trim = arr[idx][k:-k] if len(arr) > 2 * k else arr
+    w_trim = w[idx][k:-k] if len(w) > 2 * k else w
     return float(np.average(arr_trim, weights=w_trim))
 
 
@@ -188,10 +215,7 @@ def ts():
 def push(payload):
     try:
         rdb.set("news:sentiment", json.dumps(payload))
-        logging.info(
-            f"Pushed sentiment: score={payload.get('score'):.4f}, "
-            f"count={payload.get('count')}"
-        )
+        logging.info(f"Pushed → {payload}")
     except Exception as e:
         logging.error(f"Redis push failed: {e}")
 
@@ -199,43 +223,36 @@ def push(payload):
 # ======================= Main Routine =============================
 
 def run_once():
-    articles = fetch()
-    cleaned = []
+    arts_raw = fetch_headlines()
+    filtered = []
 
-    for a in articles:
-        src = (a.get("source", {}) or {}).get("name", "") or ""
+    for a in arts_raw:
+        src = a.get("source", {}).get("name", "") or ""
         title = (a.get("title") or "").strip()
         if clean_headline(title, src):
-            cleaned.append({"source": src, "title": title})
+            filtered.append({"source": src, "title": title})
 
-    logging.info(f"Valid headlines: {len(cleaned)}")
+    logging.info(f"Valid headlines: {len(filtered)}")
 
-    if not cleaned:
-        push(
-            {
-                "timestamp": ts(),
-                "score": 0.0,
-                "count": 0,
-                "mode": "weighted_all",
-                "articles": [],
-            }
-        )
+    if not filtered:
+        push({"timestamp": ts(), "score": 0.0, "count": 0, "mode": "weighted_all", "articles": []})
         return
 
-    random.shuffle(cleaned)
+    random.shuffle(filtered)
     scored = []
     scalar_scores = []
     weights = []
 
-    for art in cleaned[:24]:  # score up to 24 headlines per run
-        res = finbert(art["title"])
-        w = source_weight(art["source"])
+    for a in filtered[:24]:  # cap per run
+        w = source_weight(a["source"])
+        res = finbert(a["title"])
+
         if res is not None:
             pos, neg, neu = res
             scalar = pos - neg
             scored.append(
                 {
-                    **art,
+                    **a,
                     "pos": pos,
                     "neg": neg,
                     "neu": neu,
@@ -247,22 +264,30 @@ def run_once():
             weights.append(w)
         else:
             scored.append(
-                {**art, "pos": None, "neg": None, "neu": None, "scalar": None, "weight": w}
+                {
+                    **a,
+                    "pos": None,
+                    "neg": None,
+                    "neu": None,
+                    "scalar": None,
+                    "weight": w,
+                }
             )
+
         time.sleep(0.22)
 
-    agg = weighted_trimmed_mean(scalar_scores, weights)
-    payload = {
-        "timestamp": ts(),
-        "score": float(agg),
-        "count": int(len(scalar_scores)),
-        "mode": "weighted_all",
-        "articles": scored,
-    }
-    push(payload)
+    final = weighted_trimmed_mean(scalar_scores, weights)
 
+    push(
+        {
+            "timestamp": ts(),
+            "score": final,
+            "count": len(scalar_scores),
+            "mode": "weighted_all",
+            "articles": scored,
+        }
+    )
 
-# ======================= Loop ====================================
 
 def run_loop():
     while True:
