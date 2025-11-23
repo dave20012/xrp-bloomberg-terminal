@@ -4,10 +4,12 @@
 # - ripple_corp (Ripple treasury -> exchange)
 # Pushes latest snapshot to Redis under "xrpl:latest_inflows"
 
-import time
 import os
 import json
 import logging
+import time
+from typing import Dict, List, Set
+
 import requests
 
 from redis_client import rdb
@@ -15,9 +17,33 @@ from exchange_addresses import EXCHANGE_ADDRESSES, EXCHANGE_WEIGHTS, RIPPLE_CORP
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
-API = "https://api.whale-alert.io/v1/transactions"
-KEY = os.getenv("WHALE_ALERT_KEY")
+WHALE_ALERT_API = "https://api.whale-alert.io/v1/transactions"
+RIPPLE_DATA_API = "https://data.ripple.com/v2/accounts/{address}/transactions"
+
+WHALE_ALERT_KEY = os.getenv("WHALE_ALERT_KEY")
+PROVIDER = os.getenv("XRPL_INFLOWS_PROVIDER", "whale_alert").lower()
 RUN = int(os.getenv("XRPL_INFLOWS_INTERVAL", "600"))  # 10m default
+MIN_XRP = float(os.getenv("XRPL_MIN_XRP", "10000000"))
+LOOKBACK_SECONDS = int(os.getenv("XRPL_LOOKBACK_SECONDS", str(max(RUN * 2, 900))))
+
+
+def fetch_xrp_usd_price() -> float:
+    """Fetch current XRP/USD price for threshold conversion."""
+    try:
+        resp = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": "ripple", "vs_currencies": "usd"},
+            timeout=10,
+        )
+        if not resp.ok:
+            logging.warning(f"Price API error: {resp.status_code}")
+            return 0.0
+        data = resp.json() or {}
+        xrp = data.get("ripple") or {}
+        return float(xrp.get("usd") or 0.0)
+    except Exception as e:
+        logging.error(f"Failed to fetch XRP price: {e}")
+        return 0.0
 
 
 def owner_from_address(addr: str) -> str:
@@ -35,19 +61,25 @@ def exchange_weight(exchange: str) -> float:
     return float(EXCHANGE_WEIGHTS.get(exchange, 0.5))
 
 
-def fetch_transactions():
-    if not KEY:
+def fetch_transactions_whale_alert() -> List[Dict]:
+    """Fetch inflow transactions using Whale Alert (paid API)."""
+    if not WHALE_ALERT_KEY:
         logging.warning("WHALE_ALERT_KEY missing.")
         return []
 
+    price_usd = fetch_xrp_usd_price()
+    if price_usd <= 0:
+        logging.warning("XRP/USD price unavailable; using raw XRPL_MIN_XRP as USD for Whale Alert threshold")
+    min_value_usd = MIN_XRP * price_usd if price_usd > 0 else MIN_XRP
+
     try:
         r = requests.get(
-            API,
+            WHALE_ALERT_API,
             params={
                 "currency": "xrp",
-                "min_value": 10_000_000,  # >10M XRP
+                "min_value": min_value_usd,
                 "limit": 50,
-                "api_key": KEY,
+                "api_key": WHALE_ALERT_KEY,
             },
             timeout=15,
         )
@@ -60,7 +92,103 @@ def fetch_transactions():
         return []
 
 
+def parse_timestamp(date_str: str) -> int:
+    if not date_str:
+        return 0
+    try:
+        return int(time.mktime(time.strptime(date_str, "%Y-%m-%dT%H:%M:%SZ")))
+    except Exception:
+        return 0
+
+
+def monitored_addresses() -> Set[str]:
+    addrs: Set[str] = set()
+    for lst in EXCHANGE_ADDRESSES.values():
+        addrs.update(lst)
+    return addrs
+
+
+def fetch_transactions_ripple_data() -> List[Dict]:
+    """Fetch inflows to curated exchange addresses using Ripple Data (free)."""
+
+    flows: List[Dict] = []
+    start = time.time() - LOOKBACK_SECONDS
+    start_str = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start))
+
+    for address in monitored_addresses():
+        try:
+            resp = requests.get(
+                RIPPLE_DATA_API.format(address=address),
+                params={
+                    "type": "Payment",
+                    "result": "tesSUCCESS",
+                    "limit": 50,
+                    "start": start_str,
+                },
+                timeout=15,
+            )
+            if not resp.ok:
+                logging.warning(f"Ripple Data API error {resp.status_code} for {address}")
+                continue
+
+            data = resp.json()
+            for entry in data.get("transactions", []):
+                tx = entry.get("tx", {})
+                destination = tx.get("Destination", "")
+                if destination != address:
+                    continue  # ensure inflow into monitored address
+
+                amt = tx.get("Amount")
+                try:
+                    # For XRP, Amount is in drops (string)
+                    xrp_amt = float(amt) / 1_000_000 if amt is not None else 0.0
+                except Exception:
+                    continue
+
+                if xrp_amt < MIN_XRP:
+                    continue
+
+                timestamp = parse_timestamp(entry.get("date") or entry.get("executed_time"))
+                from_addr = tx.get("Account", "")
+
+                lower_from = from_addr.lower() if from_addr else ""
+                ripple_corp = from_addr in RIPPLE_CORP_ADDRESSES or lower_from.startswith("ripple")
+                canonical_ex = owner_from_address(address)
+                w = exchange_weight(canonical_ex)
+
+                flows.append(
+                    {
+                        "timestamp": timestamp,
+                        "xrp": xrp_amt,
+                        "exchange": canonical_ex,
+                        "to_address": address,
+                        "from_address": from_addr,
+                        "to_owner": canonical_ex,
+                        "from_owner": "",  # Ripple Data API does not provide owner strings
+                        "weight": w,
+                        "ripple_corp": ripple_corp,
+                    }
+                )
+        except Exception as e:
+            logging.error(f"Ripple Data fetch failed for {address}: {e}")
+
+    # De-duplicate by transaction hash + destination to avoid duplicates across pages
+    uniq = {}
+    for f in flows:
+        key = (f.get("from_address"), f.get("to_address"), f.get("timestamp"), f.get("xrp"))
+        if key not in uniq:
+            uniq[key] = f
+    return list(uniq.values())
+
+
+def fetch_transactions() -> List[Dict]:
+    return fetch_transactions_whale_alert()
+
+
 def build_flows():
+    if PROVIDER == "ripple_data":
+        return fetch_transactions_ripple_data()
+
     txs = fetch_transactions()
     flows = []
 
