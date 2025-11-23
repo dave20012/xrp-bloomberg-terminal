@@ -116,11 +116,52 @@ EXCHANGE_ADDRESSES = {
     # You can append more exchanges here as needed
 }
 
+# Exchange impact weights: how much a unit of inflow should count in scoring
+EXCHANGE_WEIGHTS = {
+    "Binance": 1.00,
+    "Coinbase": 0.95,
+    "Kraken": 0.85,
+    "Bitstamp": 0.80,
+    "Uphold": 0.70,
+    "KuCoin": 0.65,
+    "GateIO": 0.60,
+    "bitbank": 0.60,
+    "bitFlyer": 0.60,
+    "Coincheck": 0.60,
+    "Upbit": 0.75,
+    "Bithumb": 0.75,
+}
+
+
 # Ripple corporate / treasury style wallets (for OTC→exchange tagging)
 RIPPLE_CORP_ADDRESSES = [
     # Commonly referenced Ripple / escrow / distribution wallets.
     # This list is intentionally minimal; extend if you have a vetted list.
-    "rDsXk7KETkTRFXpqkEjXLcP1LqKLp5b2nY",
-    "rMwjYedjc7qqtKYVLiAccJSmCwih4LnE2q",
-    "rHLEki8gPUMnF72JRTtr6j8jEJ2yL6P5ks",
+    "rB3WNZc45gxzW31zxfXdkx8HusAhoqscPn",
+    "r9UUEXn3cx2seufBkDa8F86usfjWM6HiYp",
+    "rDdXiA3M4mYTQ4cFpWkVXfc2UaAXCFWeCK",
+    "rMhkqz3DeU7GUUJKGZofusbrTwZe6bDyb1",
+    "r9NpyVfLfUG8hatuCCHKzosyDtKnBdsEN3",
+    "rKDvgGUsNPZxsgmoemfrgXPS2Not4co2op",
+    "rKwJaGmB5Hz24Qs2iyCaTdUuL1WsEXUWy5",
+    "rN8pqRwLYuuvY7pUHurybPC8P6rLqVsu6o",
+    "rMQ98K56yXJbDGv49ZSmW51sLn94Xe1mu1",
+    "rGKHDyj4L6pc7DzRB6LWCR4YfZfzXj2Bdh",
+    "rHGfmgv54kpc3QCZGRXEQKUhLPndbasbQr",
+    "rKveEyR1SrkWbJX214xcfH43ZsoGMb3PEv",
+    "rw2hzLZgiQ9q62KCuaTWuFHWfiX7JWg3wY",
+    "rsjFB8mPWqiZgPUaVh8XYqdfa59PE2d5LG",
+    "rDqGA2GfveHypDguQ1KXrJzYymFZmKxEsF",
+    "rp6aTJmW3nq1aKt3Jmuz4DPRxksT5PBjpH",
+    "rpynXLU7rAHtdKmdwgiVqLSfz9xwDvK4hy",
+    "rBZz5VCEXpYzvhN8jWCC2Sb2QVDzsM5WKs",
+    "rhtufNsYfrozs4GvSq4HMYcR9y3dg8FWdC",
+    "rBg2FuZT91C52Nny68houguJ4vt5x1o91m",
+    "rJqiMb94hyz41SBTNr2AyPNW8AzELa8nE",
+    "rhyp1uMC9Xyj3Px8amUH3xVv6tbjYJkojs",
+    "r3F5NsyiGwVYs2Rs3cCcrVw4t5wZP2ZxRr",
+    "r4MoybfgCHDoUByYyMejimaX6a8CEtWtav",
+    "rhbWRsNE4v4neB5KvscrwCvcETv7c1vDJf",
+
+    
 ]
