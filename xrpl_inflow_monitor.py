@@ -1,105 +1,130 @@
-# ================= XRPL INFLOW MONITOR v10.1 ================= #
-# Tracks large XRP inbound flows to exchanges via Whale Alert
-# Pushes structured snapshot to Redis: xrpl:latest_inflows
+# ================= XRPL INFLOW MONITOR v10.2 ================= #
+# Tracks large XRPL flows into exchanges & Ripple OTC → exchanges.
+# Pushes latest snapshot into Redis key: "xrpl:latest_inflows".
 
 import time
 import os
 import json
 import logging
 import requests
+
 from redis_client import rdb
+from exchange_addresses import EXCHANGE_ADDRESSES, RIPPLE_CORP_ADDRESSES
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
-API_URL = "https://api.whale-alert.io/v1/transactions"
-WHALE_ALERT_KEY = os.getenv("WHALE_ALERT_KEY")
-RUN_INTERVAL = int(os.getenv("XRPL_INFLOWS_INTERVAL", "600"))  # 10m default
+API = "https://api.whale-alert.io/v1/transactions"
+KEY = os.getenv("WHALE_ALERT_KEY")
+RUN = int(os.getenv("XRPL_INFLOWS_INTERVAL", "600"))  # 10m default
 
 
-def fetch_raw():
-    if not WHALE_ALERT_KEY:
-        logging.warning("WHALE_ALERT_KEY missing.")
+def _exchange_from_address(addr: str) -> str | None:
+    if not addr:
+        return None
+    for name, addrs in EXCHANGE_ADDRESSES.items():
+        if addr in addrs:
+            return name
+    return None
+
+
+def fetch_transactions():
+    if not KEY:
+        logging.warning("WHALE_ALERT_KEY missing; XRPL inflow monitor idle.")
         return []
 
     try:
         r = requests.get(
-            API_URL,
+            API,
             params={
                 "currency": "xrp",
-                "min_value": 10_000_000,  # 10M XRP threshold
-                "limit": 30,
-                "api_key": WHALE_ALERT_KEY,
+                "min_value": 10_000_000,  # >10M USD threshold
+                "limit": 50,
+                "api_key": KEY,
             },
-            timeout=15,
+            timeout=20,
         )
         if not r.ok:
-            logging.warning(f"Whale Alert error: {r.status_code}")
+            logging.warning(f"Whale Alert error: {r.status_code} {r.text[:120]}")
             return []
         data = r.json()
-        return data.get("transactions", [])
+        return data.get("transactions", []) or []
     except Exception as e:
         logging.error(f"Whale Alert fetch failed: {e}")
         return []
 
 
-def normalize_transactions(tx_list):
-    """
-    Normalize Whale Alert schema into a simple XRPL inflow snapshot:
-    - only transactions where 'to.owner_type' == 'exchange'
-    - fields: timestamp, xrp, exchange, from, from_address, to_address
-    """
+def build_flows():
+    txs = fetch_transactions()
     flows = []
-    for t in tx_list:
+
+    for t in txs:
         if not isinstance(t, dict):
             continue
-
-        to_obj = t.get("to", {}) or {}
-        from_obj = t.get("from", {}) or {}
-
-        if to_obj.get("owner_type") != "exchange":
+        if t.get("blockchain") != "ripple":
             continue
 
-        try:
-            amt = float(t.get("amount", 0.0))
-        except Exception:
-            amt = 0.0
+        amount_xrp = float(t.get("amount", 0.0) or 0.0)
+        if amount_xrp <= 0:
+            continue
+
+        ts = t.get("timestamp")
+        amount_usd = t.get("amount_usd")
+        from_obj = t.get("from", {}) or {}
+        to_obj = t.get("to", {}) or {}
+
+        from_addr = from_obj.get("address")
+        to_addr = to_obj.get("address")
+        to_type = to_obj.get("owner_type")
+        to_owner = to_obj.get("owner")
+
+        # try to resolve exchange name via address dictionary
+        exchange_name = _exchange_from_address(to_addr)
+        if not exchange_name and to_type == "exchange":
+            exchange_name = to_owner
+
+        if not exchange_name:
+            # not clearly an exchange inflow
+            continue
+
+        # classify Ripple OTC if sender is corporate + receiver is exchange
+        flow_type = "exchange_inflow"
+        if from_addr in RIPPLE_CORP_ADDRESSES:
+            flow_type = "ripple_otc"
 
         flows.append(
             {
-                "timestamp": t.get("timestamp"),
-                "xrp": amt,
-                "exchange": to_obj.get("owner") or "unknown",
-                "from": from_obj.get("owner") or "unknown",
-                "from_address": from_obj.get("address"),
-                "to_address": to_obj.get("address"),
-                "txid": t.get("hash") or t.get("transaction_hash"),
+                "timestamp": ts,
+                "xrp": amount_xrp,
+                "amount_usd": amount_usd,
+                "exchange": exchange_name,
+                "from_address": from_addr,
+                "to_address": to_addr,
+                "flow_type": flow_type,  # "exchange_inflow" or "ripple_otc"
             }
         )
 
     return flows
 
 
-def push_snapshot(flows):
+def push(flows):
     try:
         rdb.set("xrpl:latest_inflows", json.dumps(flows))
-        logging.info(f"XRPL inflows snapshot pushed: {len(flows)} records")
+        logging.info(
+            f"XRPL inflows pushed: {len(flows)} records "
+            f"({sum(f.get('xrp', 0.0) for f in flows):,.0f} XRP)"
+        )
     except Exception as e:
-        logging.error(f"Redis push failed: {e}")
-
-
-def run_once():
-    raw = fetch_raw()
-    flows = normalize_transactions(raw)
-    push_snapshot(flows)
+        logging.error(f"XRPL inflow Redis push failed: {e}")
 
 
 def loop():
     while True:
         try:
-            run_once()
+            flows = build_flows()
+            push(flows)
         except Exception as e:
             logging.error(f"XRPL inflow loop error: {e}")
-        time.sleep(RUN_INTERVAL)
+        time.sleep(RUN)
 
 
 if __name__ == "__main__":
