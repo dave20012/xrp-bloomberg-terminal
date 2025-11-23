@@ -96,33 +96,51 @@ def fetch():
 def finbert(text: str):
     if not HF_TOKEN:
         return None
-    url = "https://router.huggingface.co"
-    hdr = {"Authorization": f"Bearer {HF_TOKEN}"}
-    payload = {"inputs": text, "model": "ProsusAI/finbert"}
 
-    for _ in range(2):  # retry once
+    # Primary: direct FinBERT inference endpoint
+    url_primary = "https://api-inference.huggingface.co/models/ProsusAI/finbert"
+    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+    payload = {"inputs": text}
+
+    for _ in range(2):  # retry
         try:
-            r = requests.post(url, headers=hdr, json=payload, timeout=20)
-            if r.status_code != 200:
-                logging.warning(f"FinBERT error {r.status_code}: {r.text[:90]}")
+            r = requests.post(url_primary, headers=headers, json=payload, timeout=20)
+            if r.status_code == 503:
+                time.sleep(1.0)  # model is cold starting
                 continue
+            if r.status_code == 200:
+                resp = r.json()
+                if isinstance(resp, list) and resp:
+                    preds = resp[0]
+                    scores = {x["label"]: x["score"] for x in preds}
+                    return (
+                        scores.get("positive", 0.0),
+                        scores.get("negative", 0.0),
+                        scores.get("neutral", 0.0),
+                    )
+            logging.warning(f"FinBERT error {r.status_code}: {r.text[:120]}")
+        except Exception as e:
+            logging.error(f"FinBERT primary call failed: {e}")
 
-            resp = r.json()
-
-            # Standard HF router output
-            if isinstance(resp, list) and resp and isinstance(resp[0], list):
-                preds = resp[0]
+    # Fallback: Router (rarely works for FinBERT, but just in case)
+    url_backup = "https://router.huggingface.co"
+    payload2 = {"inputs": text, "model": "ProsusAI/finbert"}
+    for _ in range(1):
+        try:
+            r = requests.post(url_backup, headers=headers, json=payload2, timeout=20)
+            if r.status_code == 200 and isinstance(r.json(), list):
+                preds = r.json()[0]
                 scores = {x["label"]: x["score"] for x in preds}
                 return (
                     scores.get("positive", 0.0),
                     scores.get("negative", 0.0),
                     scores.get("neutral", 0.0),
                 )
-        except Exception as e:
-            logging.error(f"FinBERT inference failed: {e}")
-            time.sleep(0.5)
+        except Exception:
+            pass
 
     return None
+
 
 
 # ===================== Score Aggregation ==========================
@@ -237,3 +255,4 @@ def run_loop():
 
 if __name__ == "__main__":
     run_loop()
+
