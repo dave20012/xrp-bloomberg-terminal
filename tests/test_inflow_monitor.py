@@ -59,6 +59,33 @@ class FetchTransactionsTests(unittest.TestCase):
         mock_ripple.assert_called_once()
         mock_whale.assert_not_called()
 
+    def test_build_flows_prefers_cached_when_ripple_data_empty(self):
+        monitor.PROVIDER = "ripple_data"
+
+        with mock.patch(
+            "xrpl_inflow_monitor.fetch_transactions_ripple_data", return_value=[]
+        ) as mock_ripple, mock.patch(
+            "xrpl_inflow_monitor.fetch_cached_flows", return_value=[{"xrp": 4}]
+        ) as mock_cached:
+            flows = monitor.build_flows()
+
+        self.assertEqual(flows, [{"xrp": 4}])
+        mock_ripple.assert_called_once()
+        mock_cached.assert_called_once()
+
+    def test_build_flows_prefers_cached_when_whale_alert_empty(self):
+        monitor.PROVIDER = "whale_alert"
+        monitor.WHALE_ALERT_KEY = "key"
+
+        with mock.patch("xrpl_inflow_monitor.fetch_transactions", return_value=[]) as mock_fetch, mock.patch(
+            "xrpl_inflow_monitor.fetch_cached_flows", return_value=[{"xrp": 5}]
+        ) as mock_cached:
+            flows = monitor.build_flows()
+
+        self.assertEqual(flows, [{"xrp": 5}])
+        mock_fetch.assert_called_once()
+        mock_cached.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
