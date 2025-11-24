@@ -1,7 +1,7 @@
 """Unit coverage for app_utils helper functions."""
 
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 import app_utils
@@ -85,6 +85,24 @@ class DataHealthTests(unittest.TestCase):
                 return []
             if key == "xrpl:inflow_history":
                 return []
+            return None
+
+        mock_cache.side_effect = cache_side_effect
+
+        live = {"price": 0.5, "oi_usd": 1.0, "funding_hist_pct": [0.01], "xrpl_weighted_inflow": 0}
+        news_payload = {"count": 1}
+
+        _, redis_notes = app_utils.describe_data_health(live, news_payload)
+
+        self.assertFalse(any("xrpl:latest_inflows" in note for note in redis_notes))
+
+    @mock.patch("app_utils.cache_get_json")
+    def test_describe_data_health_uses_inflow_timestamp(self, mock_cache):
+        recent_ts = datetime.now(timezone.utc) - timedelta(seconds=300)
+
+        def cache_side_effect(key):
+            if key == "xrpl:latest_inflows":
+                return [{"timestamp": recent_ts.timestamp()}]
             return None
 
         mock_cache.side_effect = cache_side_effect
