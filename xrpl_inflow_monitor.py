@@ -642,7 +642,7 @@ def build_flows() -> Tuple[List[Dict], List[Dict]]:
 
 def push(inflows: List[Dict], outflows: List[Dict]):
     try:
-        rdb.set("xrpl:latest_inflows", json.dumps(flows))
+        rdb.set("xrpl:latest_inflows", json.dumps(inflows))
         rdb.set(
             "xrpl:latest_inflows_meta",
             json.dumps(
@@ -651,13 +651,13 @@ def push(inflows: List[Dict], outflows: List[Dict]):
                     .isoformat()
                     .replace("+00:00", "Z"),
                     "provider": resolve_provider(),
-                    "count": len(flows),
+                    "count": len(inflows),
                     "run_seconds": RUN,
                 }
             ),
         )
-        logging.info(f"XRPL inflows snapshot pushed: {len(flows)} txs")
-        append_history(flows)
+        logging.info(f"XRPL inflows snapshot pushed: {len(inflows)} txs")
+        append_history(inflows)
 
         if MONITOR_OUTFLOWS:
             rdb.set("xrpl:latest_outflows", json.dumps(outflows))
