@@ -96,6 +96,74 @@ def cache_get_json(key: str) -> Any:
     return None
 
 
+def cached_coingecko_simple_price(
+    ids: str, vs_currencies: str = "usd", fresh_ttl: int = 60, stale_ttl: int = 300
+) -> Optional[Dict[str, Any]]:
+    """Fetch CoinGecko simple price with Redis-backed throttling.
+
+    - Returns cached data if it is newer than ``fresh_ttl`` seconds to avoid
+      hammering the API and triggering HTTP 429 responses.
+    - On request failure, returns a recent cached payload when available (up to
+      ``stale_ttl`` seconds old).
+    """
+
+    cache_key = f"cache:coingecko:simple_price:{ids}:{vs_currencies}"
+    now = time.time()
+
+    cached = cache_get_json(cache_key) or {}
+    cached_ts = float(cached.get("ts", 0.0))
+    cached_payload = cached.get("payload") if isinstance(cached, dict) else None
+
+    if cached_payload and now - cached_ts <= fresh_ttl:
+        return cached_payload
+
+    payload = safe_get(
+        "https://api.coingecko.com/api/v3/simple/price",
+        {"ids": ids, "vs_currencies": vs_currencies},
+        timeout=REQUEST_TIMEOUT,
+    )
+
+    if payload:
+        cache_set_json(cache_key, {"ts": now, "payload": payload})
+        return payload
+
+    if cached_payload and now - cached_ts <= stale_ttl:
+        return cached_payload
+
+    return None
+
+
+def cached_crypto_compare_price(symbol: str = "XRP", currency: str = "USD", ttl: int = 300) -> Optional[float]:
+    """Try CryptoCompare's price endpoint as a resilient fallback."""
+
+    cache_key = f"cache:cryptocompare:price:{symbol}:{currency}"
+    now = time.time()
+    cached = cache_get_json(cache_key)
+    if isinstance(cached, dict):
+        ts = float(cached.get("ts", 0.0))
+        if now - ts <= ttl:
+            try:
+                return float(cached.get("price"))
+            except Exception:
+                pass
+
+    params = {"fsym": symbol, "tsyms": currency}
+    api_key = normalize_env_value("CRYPTOCOMPARE_API_KEY")
+    if api_key:
+        params["api_key"] = api_key
+
+    resp = safe_get("https://min-api.cryptocompare.com/data/price", params=params, timeout=REQUEST_TIMEOUT)
+    if resp and currency in resp:
+        try:
+            price = float(resp[currency])
+            cache_set_json(cache_key, {"ts": now, "price": price})
+            return price
+        except Exception:
+            return None
+
+    return None
+
+
 def safe_get(
     url: str,
     params: Optional[Dict[str, Any]] = None,
@@ -104,6 +172,9 @@ def safe_get(
 ) -> Any:
     try:
         resp = requests.get(url, params=params, timeout=timeout, headers=headers)
+        if resp.status_code == 429:
+            logger.warning("GET %s throttled with 429; falling back to cache when possible", url)
+            return None
         if not resp.ok:
             logger.warning("GET %s failed with status %s", url, resp.status_code)
             return None
@@ -111,6 +182,20 @@ def safe_get(
     except Exception as exc:  # noqa: BLE001
         logger.warning("GET %s raised exception: %s", url, exc)
         return None
+
+
+def cache_with_expiry(key: str, value: Any, ttl_seconds: int) -> None:
+    cache_set_json(key, {"value": value, "ts": time.time(), "ttl": ttl_seconds})
+
+
+def read_cached_value(key: str, ttl_seconds: int) -> Optional[Any]:
+    cached = cache_get_json(key)
+    if not isinstance(cached, dict):
+        return None
+    ts = float(cached.get("ts", 0.0))
+    if time.time() - ts <= ttl_seconds:
+        return cached.get("value")
+    return None
 
 
 def compute_sentiment_components(articles: List[Dict[str, Any]], mode: str) -> Tuple[float, float, float]:
@@ -349,37 +434,50 @@ def fetch_live():
         "xrpl_ripple_otc": 0.0,
     }
 
-    # Price with Redis fallback
-    price_live_ok = False
-    try:
-        pd_json = safe_get(
-            "https://api.coingecko.com/api/v3/simple/price",
-            {"ids": "ripple", "vs_currencies": "usd"},
-        )
-        if pd_json and "ripple" in pd_json:
-            px = float(pd_json["ripple"]["usd"])
+    # Price with Redis fallback and throttled CoinGecko usage, then Binance/CryptoCompare
+    price_resp = cached_coingecko_simple_price("ripple")
+    if price_resp and "ripple" in price_resp:
+        try:
+            px = float(price_resp["ripple"]["usd"])
             result["price"] = px
-            price_live_ok = True
             cache_set_json("cache:price:xrp_usd", {"price": px, "ts": time.time()})
-    except Exception:
-        pass
+        except Exception:
+            pass
 
-    if not price_live_ok:
+    if result["price"] is None:
+        ticker = safe_get(
+            "https://api.binance.com/api/v3/ticker/price",
+            {"symbol": "XRPUSDT"},
+            timeout=REQUEST_TIMEOUT,
+        )
+        if ticker and "price" in ticker:
+            try:
+                px = float(ticker["price"])
+                result["price"] = px
+                cache_set_json("cache:price:xrp_usd", {"price": px, "ts": time.time()})
+            except Exception:
+                pass
+
+    if result["price"] is None:
+        cc_price = cached_crypto_compare_price()
+        if cc_price is not None:
+            result["price"] = cc_price
+            cache_set_json("cache:price:xrp_usd", {"price": cc_price, "ts": time.time()})
+
+    if result["price"] is None:
         cached = cache_get_json("cache:price:xrp_usd")
         if cached:
             result["price"] = float(cached.get("price", 0.0))
 
-    # XRP/BTC, XRP/ETH ratios and ratio EMAs
-    ratio_resp = safe_get(
-        "https://api.coingecko.com/api/v3/simple/price",
-        {"ids": "ripple,bitcoin,ethereum", "vs_currencies": "usd"},
-    )
+    # XRP/BTC, XRP/ETH ratios and ratio EMAs (throttled)
+    ratio_resp = cached_coingecko_simple_price("ripple,bitcoin,ethereum")
+    px_xrp = result["price"] or 0.0
     if ratio_resp:
         try:
             xrp = ratio_resp.get("ripple", {})
             btc = ratio_resp.get("bitcoin", {})
             eth = ratio_resp.get("ethereum", {})
-            px_xrp = float(xrp.get("usd", result["price"] or 0.0) or 0.0)
+            px_xrp = float(xrp.get("usd", px_xrp) or px_xrp)
             px_btc = float(btc.get("usd", 0.0) or 0.0)
             px_eth = float(eth.get("usd", 0.0) or 0.0)
             if px_btc > 0:
@@ -388,6 +486,25 @@ def fetch_live():
                 result["xrp_eth"] = px_xrp / px_eth
         except Exception:
             pass
+    else:
+        # Binance public tickers as a fallback (mirrors older working implementation)
+        tickers = safe_get(
+            "https://api.binance.com/api/v3/ticker/price",
+            {"symbols": json.dumps(["XRPUSDT", "BTCUSDT", "ETHUSDT"])},
+            timeout=REQUEST_TIMEOUT,
+        )
+        if isinstance(tickers, list):
+            px_map = {t.get("symbol"): t.get("price") for t in tickers}
+            try:
+                px_xrp = float(px_map.get("XRPUSDT", px_xrp) or px_xrp)
+                px_btc = float(px_map.get("BTCUSDT", 0.0) or 0.0)
+                px_eth = float(px_map.get("ETHUSDT", 0.0) or 0.0)
+                if px_btc > 0:
+                    result["xrp_btc"] = px_xrp / px_btc
+                if px_eth > 0:
+                    result["xrp_eth"] = px_xrp / px_eth
+            except Exception:
+                pass
 
     # Funding rate
     fr_json = safe_get(
@@ -397,8 +514,14 @@ def fetch_live():
     if fr_json and "lastFundingRate" in fr_json:
         try:
             result["funding_now_pct"] = float(fr_json["lastFundingRate"]) * 100
+            cache_with_expiry("cache:funding_now_pct", result["funding_now_pct"], 3600)
         except Exception:
             pass
+    else:
+        cached_funding_now = read_cached_value("cache:funding_now_pct", 3600)
+        if cached_funding_now is not None:
+            result["funding_now_pct"] = float(cached_funding_now)
+            result["binance_notes"].append("Funding rate sourced from cached Binance response (API unavailable).")
 
     # Open interest
     oi_json = safe_get(
@@ -410,8 +533,14 @@ def fetch_live():
             oi_contracts = float(oi_json["openInterest"])
             if result["price"]:
                 result["oi_usd"] = oi_contracts * result["price"]
+                cache_with_expiry("cache:oi_usd", result["oi_usd"], 900)
         except Exception:
             pass
+    else:
+        cached_oi = read_cached_value("cache:oi_usd", 900)
+        if cached_oi is not None:
+            result["oi_usd"] = float(cached_oi)
+            result["binance_notes"].append("Open interest sourced from cached Binance response (API unavailable).")
 
     # Funding history
     fh_json = safe_get(
@@ -422,8 +551,16 @@ def fetch_live():
         try:
             rates = [float(x["fundingRate"]) * 100 for x in fh_json[-90:]]
             result["funding_hist_pct"] = rates
+            cache_with_expiry("cache:funding_hist_pct", rates, 6 * 3600)
         except Exception:
             pass
+    else:
+        cached_hist = read_cached_value("cache:funding_hist_pct", 6 * 3600)
+        if cached_hist:
+            result["funding_hist_pct"] = cached_hist
+            result["binance_notes"].append(
+                "Funding history sourced from cached Binance response (API unavailable)."
+            )
 
     # Long/Short ratio
     ls_json = safe_get(
