@@ -23,6 +23,7 @@ RIPPLE_DATA_API = "https://data.ripple.com/v2/accounts/{address}/transactions"
 RIPPLE_DATA_HEADERS = {"User-Agent": "xrpl-inflow-monitor/1.0", "Accept": "application/json"}
 
 RIPPLE_DATA_COOLDOWN_SECONDS = int(os.getenv("RIPPLE_DATA_COOLDOWN_SECONDS", "900"))
+RIPPLE_DATA_MAX_COOLDOWN_SECONDS = int(os.getenv("RIPPLE_DATA_MAX_COOLDOWN_SECONDS", "3600"))
 
 WHALE_ALERT_KEY = os.getenv("WHALE_ALERT_KEY")
 ENV_PROVIDER = os.getenv("XRPL_INFLOWS_PROVIDER", "whale_alert").lower()
@@ -33,6 +34,7 @@ LOOKBACK_SECONDS = int(os.getenv("XRPL_LOOKBACK_SECONDS", str(max(RUN * 2, 900))
 
 _missing_key_info_logged = False
 ripple_data_cooldown_until = 0.0
+ripple_data_failure_streak = 0
 
 
 def resolve_provider() -> str:
@@ -153,6 +155,8 @@ def fetch_cached_flows() -> List[Dict]:
 def fetch_transactions_ripple_data() -> List[Dict]:
     """Fetch inflows to curated exchange addresses using Ripple Data (free)."""
 
+    global ripple_data_failure_streak
+
     flows: List[Dict] = []
     start = time.time() - LOOKBACK_SECONDS
     start_str = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start))
@@ -182,11 +186,18 @@ def fetch_transactions_ripple_data() -> List[Dict]:
                 timeout=15,
             )
             if resp.status_code == 403:
-                logging.warning(
-                    "Ripple Data API returned 403 for %s; halting further XRPL inflow requests to avoid bans",
-                    address,
+                ripple_data_failure_streak = min(ripple_data_failure_streak + 1, 10)
+                cooldown_seconds = min(
+                    RIPPLE_DATA_COOLDOWN_SECONDS * (2 ** (ripple_data_failure_streak - 1)),
+                    RIPPLE_DATA_MAX_COOLDOWN_SECONDS,
                 )
-                ripple_data_cooldown_until = time.time() + RIPPLE_DATA_COOLDOWN_SECONDS
+                ripple_data_cooldown_until = time.time() + cooldown_seconds
+                logging.warning(
+                    "Ripple Data API returned 403 for %s; halting further XRPL inflow requests for %.0fs (failure streak: %d)",
+                    address,
+                    cooldown_seconds,
+                    ripple_data_failure_streak,
+                )
                 cached = fetch_cached_flows()
                 if cached:
                     logging.info("Serving cached XRPL inflows during Ripple Data cooldown")
@@ -198,6 +209,7 @@ def fetch_transactions_ripple_data() -> List[Dict]:
                 continue
 
             data = resp.json()
+            ripple_data_failure_streak = 0
             for entry in data.get("transactions", []):
                 tx = entry.get("tx", {})
                 destination = tx.get("Destination", "")
