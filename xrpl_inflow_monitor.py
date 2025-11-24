@@ -24,6 +24,7 @@ RIPPLE_DATA_HEADERS = {"User-Agent": "xrpl-inflow-monitor/1.0", "Accept": "appli
 
 RIPPLE_DATA_COOLDOWN_SECONDS = int(os.getenv("RIPPLE_DATA_COOLDOWN_SECONDS", "900"))
 RIPPLE_DATA_MAX_COOLDOWN_SECONDS = int(os.getenv("RIPPLE_DATA_MAX_COOLDOWN_SECONDS", "3600"))
+RIPPLE_DATA_REQUEST_INTERVAL = float(os.getenv("RIPPLE_DATA_REQUEST_INTERVAL", "1.0"))
 
 WHALE_ALERT_KEY = os.getenv("WHALE_ALERT_KEY")
 ENV_PROVIDER = os.getenv("XRPL_INFLOWS_PROVIDER", "whale_alert").lower()
@@ -219,7 +220,7 @@ def fetch_transactions_ripple_data() -> List[Dict]:
                 break
             if not resp.ok:
                 logging.warning(f"Ripple Data API error {resp.status_code} for {address}")
-                time.sleep(0.25)
+                time.sleep(RIPPLE_DATA_REQUEST_INTERVAL)
                 continue
 
             data = resp.json()
@@ -261,7 +262,7 @@ def fetch_transactions_ripple_data() -> List[Dict]:
                         "ripple_corp": ripple_corp,
                     }
                 )
-            time.sleep(0.25)
+            time.sleep(RIPPLE_DATA_REQUEST_INTERVAL)
         except Exception as e:
             logging.error(f"Ripple Data fetch failed for {address}: {e}")
 
