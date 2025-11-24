@@ -16,6 +16,13 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from app_utils import (
+    cache_get_json,
+    cache_set_json,
+    compute_sentiment_components,
+    describe_data_health,
+    safe_get,
+)
 from redis_client import rdb
 
 # =========================
@@ -34,47 +41,13 @@ st.markdown(
 
 META_REFRESH_SECONDS = int(os.getenv("META_REFRESH_SECONDS", "45"))
 st.markdown(f'<meta http-equiv="refresh" content="{META_REFRESH_SECONDS}">', unsafe_allow_html=True)
+st.caption(
+    f"Dashboard auto-refreshes every {META_REFRESH_SECONDS} seconds; lower values increase API usage."
+)
 
 REQUEST_TIMEOUT = 10
 SENTIMENT_EMA_ALPHA = float(os.getenv("SENTIMENT_EMA_ALPHA", "0.3"))
 RATIO_EMA_ALPHA = float(os.getenv("RATIO_EMA_ALPHA", "0.1"))
-
-# =========================
-# Redis helpers
-# =========================
-
-def cache_set_json(key: str, obj):
-    try:
-        rdb.set(key, json.dumps(obj))
-    except Exception:
-        pass
-
-
-def cache_get_json(key: str):
-    try:
-        raw = rdb.get(key)
-        if raw:
-            if isinstance(raw, bytes):
-                raw = raw.decode("utf-8")
-            return json.loads(raw)
-    except Exception:
-        pass
-    return None
-
-
-# =========================
-# HTTP helper
-# =========================
-
-def safe_get(url, params=None, timeout=REQUEST_TIMEOUT):
-    try:
-        r = requests.get(url, params=params, timeout=timeout)
-        if not r.ok:
-            return None
-        return r.json()
-    except Exception:
-        return None
-
 
 # =========================
 # Chart data (90d OHLC + volume)
@@ -379,38 +352,6 @@ def write_sentiment_ema(value: float):
     )
 
 
-def compute_sentiment_components(articles, mode: str):
-    """
-    Compute (instant_sentiment_scalar, bull, bear) from per-article
-    pos/neg and weights (v9.3 payload).
-    """
-    usable = []
-    for a in articles:
-        scalar = a.get("scalar")
-        w = a.get("weight", 0.0)
-        if scalar is None or not isinstance(w, (int, float)):
-            continue
-        if mode == "Institutional Only" and w < 0.6:
-            continue
-        usable.append(a)
-
-    if not usable:
-        return 0.0, 0.0, 0.0
-
-    weights = np.array([u.get("weight", 0.0) for u in usable], dtype=float)
-    pos_arr = np.array([u.get("pos", 0.0) or 0.0 for u in usable], dtype=float)
-    neg_arr = np.array([u.get("neg", 0.0) or 0.0 for u in usable], dtype=float)
-    scalar_arr = np.array([u.get("scalar", 0.0) or 0.0 for u in usable], dtype=float)
-
-    if weights.sum() <= 0:
-        return 0.0, 0.0, 0.0
-
-    bull = float(np.average(pos_arr, weights=weights))
-    bear = float(np.average(neg_arr, weights=weights))
-    inst = float(np.average(scalar_arr, weights=weights))
-    return inst, bull, bear
-
-
 news_payload = read_sentiment()
 articles = news_payload.get("articles", [])
 
@@ -520,17 +461,11 @@ total_score = float(min(100.0, sum(points.values())))
 # Data health banner
 # =========================
 
-issues = []
-if not live.get("price"):
-    issues.append("XRP price feed")
-if live.get("oi_usd") is None:
-    issues.append("Open interest")
-if news_payload.get("count", 0) == 0:
-    issues.append("News sentiment (FinBERT)")
-if not live.get("funding_hist_pct"):
-    issues.append("Funding history")
+issues, redis_notes = describe_data_health(live, news_payload)
 if issues:
     st.warning("Data issues: " + ", ".join(issues))
+if redis_notes:
+    st.info("Redis/cache notes:\n- " + "\n- ".join(redis_notes))
 
 # =========================
 # UI — Metrics

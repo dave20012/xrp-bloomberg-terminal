@@ -20,6 +20,10 @@ class _InMemoryRedis:
 
 REDIS_URL = os.getenv("REDIS_URL")
 
+if REDIS_URL and REDIS_URL.startswith("${"):
+    logging.warning("REDIS_URL placeholder detected; using in-memory cache instead.")
+    REDIS_URL = ""
+
 if not REDIS_URL:
     logging.warning("REDIS_URL not set; using in-memory cache (data not persisted).")
     rdb = _InMemoryRedis()
