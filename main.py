@@ -129,7 +129,10 @@ def read_ratio_ema(name: str):
 def write_ratio_ema(name: str, value: float):
     cache_set_json(
         f"ratio_ema:{name}",
-        {"ema": float(value), "timestamp": datetime.utcnow().isoformat() + "Z"},
+        {
+            "ema": float(value),
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        },
     )
 
 
@@ -166,7 +169,7 @@ def append_binance_netflow_history(value: float, ts: str, max_len: int = 120) ->
 
 
 def write_cached_binance_netflow(value: float):
-    ts = datetime.utcnow().isoformat() + "Z"
+    ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     cache_set_json("cache:binance_netflow_24h", {"value": float(value), "ts": ts})
     append_binance_netflow_history(value, ts)
 

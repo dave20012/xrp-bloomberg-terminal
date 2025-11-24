@@ -22,6 +22,8 @@ WHALE_ALERT_API = "https://api.whale-alert.io/v1/transactions"
 RIPPLE_DATA_API = "https://data.ripple.com/v2/accounts/{address}/transactions"
 RIPPLE_DATA_HEADERS = {"User-Agent": "xrpl-inflow-monitor/1.0", "Accept": "application/json"}
 
+RIPPLE_DATA_COOLDOWN_SECONDS = int(os.getenv("RIPPLE_DATA_COOLDOWN_SECONDS", "900"))
+
 WHALE_ALERT_KEY = os.getenv("WHALE_ALERT_KEY")
 ENV_PROVIDER = os.getenv("XRPL_INFLOWS_PROVIDER", "whale_alert").lower()
 PROVIDER = ENV_PROVIDER
@@ -30,6 +32,7 @@ MIN_XRP = float(os.getenv("XRPL_MIN_XRP", "10000000"))
 LOOKBACK_SECONDS = int(os.getenv("XRPL_LOOKBACK_SECONDS", str(max(RUN * 2, 900))))
 
 _missing_key_info_logged = False
+ripple_data_cooldown_until = 0.0
 
 
 def resolve_provider() -> str:
@@ -129,12 +132,41 @@ def monitored_addresses() -> Set[str]:
     return addrs
 
 
+def fetch_cached_flows() -> List[Dict]:
+    """Return the last successful inflow snapshot from Redis (if available)."""
+
+    try:
+        raw = rdb.get("xrpl:latest_inflows")
+        if not raw:
+            return []
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return data
+    except Exception:
+        pass
+
+    return []
+
+
 def fetch_transactions_ripple_data() -> List[Dict]:
     """Fetch inflows to curated exchange addresses using Ripple Data (free)."""
 
     flows: List[Dict] = []
     start = time.time() - LOOKBACK_SECONDS
     start_str = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start))
+
+    global ripple_data_cooldown_until
+    now = time.time()
+    if ripple_data_cooldown_until and now < ripple_data_cooldown_until:
+        logging.warning(
+            "Ripple Data API is in cooldown until %s; reusing cached inflows where possible",
+            datetime.fromtimestamp(ripple_data_cooldown_until, tz=timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z"),
+        )
+        return fetch_cached_flows()
 
     for address in monitored_addresses():
         try:
@@ -154,6 +186,11 @@ def fetch_transactions_ripple_data() -> List[Dict]:
                     "Ripple Data API returned 403 for %s; halting further XRPL inflow requests to avoid bans",
                     address,
                 )
+                ripple_data_cooldown_until = time.time() + RIPPLE_DATA_COOLDOWN_SECONDS
+                cached = fetch_cached_flows()
+                if cached:
+                    logging.info("Serving cached XRPL inflows during Ripple Data cooldown")
+                    return cached
                 break
             if not resp.ok:
                 logging.warning(f"Ripple Data API error {resp.status_code} for {address}")
