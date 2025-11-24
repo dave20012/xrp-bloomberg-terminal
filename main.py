@@ -129,7 +129,7 @@ def read_ratio_ema(name: str):
 def write_ratio_ema(name: str, value: float):
     cache_set_json(
         f"ratio_ema:{name}",
-        {"ema": float(value), "timestamp": datetime.now(timezone.utc).isoformat()},
+        {"ema": float(value), "timestamp": datetime.utcnow().isoformat() + "Z"},
     )
 
 
@@ -166,16 +166,9 @@ def append_binance_netflow_history(value: float, ts: str, max_len: int = 120) ->
 
 
 def write_cached_binance_netflow(value: float):
-    ts = datetime.now(timezone.utc).isoformat()
+    ts = datetime.utcnow().isoformat() + "Z"
     cache_set_json("cache:binance_netflow_24h", {"value": float(value), "ts": ts})
     append_binance_netflow_history(value, ts)
-
-
-def _parse_ts(ts: str):
-    try:
-        return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(timezone.utc)
-    except Exception:
-        return None
 
 
 # =========================
@@ -295,24 +288,9 @@ def fetch_live():
             pass
 
     # Binance signed netflow (XRP)
-    cached_netflow_val, cached_netflow_ts = read_cached_binance_netflow()
-    cached_recent = False
-    if cached_netflow_ts:
-        parsed_ts = _parse_ts(cached_netflow_ts)
-        if parsed_ts and datetime.now(timezone.utc) - parsed_ts < timedelta(hours=23):
-            cached_recent = True
-            if cached_netflow_val is not None:
-                result["binance_netflow_24h"] = cached_netflow_val
-
     api_key = os.getenv("BINANCE_API_KEY")
     api_secret = os.getenv("BINANCE_API_SECRET")
-    if (
-        api_key
-        and api_secret
-        and api_key.strip()
-        and api_secret.strip()
-        and not cached_recent
-    ):
+    if api_key and api_secret and api_key.strip() and api_secret.strip():
         try:
             ts_ms = int(time.time() * 1000)
             start = ts_ms - 86_400_000  # 24h
@@ -327,8 +305,8 @@ def fetch_live():
             dep_url = f"{base}/sapi/v1/capital/deposit/hisrec?{query_string}&signature={signature}"
             wd_url = f"{base}/sapi/v1/capital/withdraw/history?{query_string}&signature={signature}"
 
-            dep = safe_get(dep_url, None, headers=headers)
-            wd = safe_get(wd_url, None, headers=headers)
+            dep = safe_get(dep_url, None)
+            wd = safe_get(wd_url, None)
             dep = dep or []
             wd = wd or []
 
@@ -346,8 +324,9 @@ def fetch_live():
             pass
 
     if result["binance_netflow_24h"] is None:
-        if cached_netflow_val is not None:
-            result["binance_netflow_24h"] = cached_netflow_val
+        cached_val, _ = read_cached_binance_netflow()
+        if cached_val is not None:
+            result["binance_netflow_24h"] = cached_val
         else:
             result["binance_netflow_24h"] = 0.0
 
