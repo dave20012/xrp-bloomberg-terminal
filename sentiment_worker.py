@@ -109,6 +109,27 @@ def clean_headline(title: str, src: str) -> bool:
     return True
 
 
+def dedupe_headlines(items):
+    """Return headlines with duplicate titles removed (case/whitespace-insensitive)."""
+
+    seen = set()
+    unique = []
+
+    for a in items:
+        title = (a.get("title") or "").strip().lower()
+        if not title:
+            continue
+
+        normalized = re.sub(r"\s+", " ", title)
+        if normalized in seen:
+            continue
+
+        seen.add(normalized)
+        unique.append(a)
+
+    return unique
+
+
 # ===================== Fetch Headlines ===========================
 
 def fetch_headlines():
@@ -265,6 +286,8 @@ def run_once():
         title = (a.get("title") or "").strip()
         if clean_headline(title, src):
             filtered.append({"source": src, "title": title})
+
+    filtered = dedupe_headlines(filtered)
 
     logging.info(f"Valid headlines: {len(filtered)}")
 

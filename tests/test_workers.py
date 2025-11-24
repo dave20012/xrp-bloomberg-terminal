@@ -2,7 +2,7 @@ import json
 import unittest
 
 from redis_client import rdb
-from sentiment_worker import read_sentiment_ema, write_sentiment_ema
+from sentiment_worker import dedupe_headlines, read_sentiment_ema, write_sentiment_ema
 from xrpl_inflow_monitor import append_history
 
 
@@ -51,6 +51,20 @@ class InflowHistoryTests(unittest.TestCase):
         self.assertEqual(len(history), 2)
         self.assertAlmostEqual(history[-1]["total_xrp"], 1_500_000)
         self.assertGreater(history[-1]["weighted_xrp"], 0)
+
+
+class SentimentHeadlineTests(unittest.TestCase):
+    def test_dedupe_headlines_normalizes_title(self):
+        items = [
+            {"source": "A", "title": "XRP falls below $1"},
+            {"source": "B", "title": "xrp falls  below   $1 "},
+            {"source": "C", "title": "XRP climbs"},
+        ]
+
+        deduped = dedupe_headlines(items)
+
+        self.assertEqual(len(deduped), 2)
+        self.assertEqual(deduped[0]["source"], "A")
 
 
 if __name__ == "__main__":
