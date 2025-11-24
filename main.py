@@ -96,6 +96,25 @@ def cache_get_json(key: str) -> Any:
     return None
 
 
+def empty_live_payload() -> Dict[str, Any]:
+    """Base structure for live metrics with safe defaults."""
+
+    return {
+        "price": None,
+        "funding_now_pct": 0.0,
+        "funding_hist_pct": [],
+        "oi_usd": None,
+        "long_short_ratio": 1.0,
+        "binance_netflow_24h": None,
+        "binance_notes": [],
+        "xrp_btc": None,
+        "xrp_eth": None,
+        "xrpl_raw_inflow": 0.0,
+        "xrpl_weighted_inflow": 0.0,
+        "xrpl_ripple_otc": 0.0,
+    }
+
+
 def cached_coingecko_simple_price(
     ids: str, vs_currencies: str = "usd", fresh_ttl: int = 60, stale_ttl: int = 300
 ) -> Optional[Dict[str, Any]]:
@@ -419,20 +438,7 @@ def fetch_live():
     - Binance signed netflows (XRP) using API keys when provided
     - XRPL inflows (raw/weighted) and Ripple OTC flows from Redis
     """
-    result = {
-        "price": None,
-        "funding_now_pct": 0.0,
-        "funding_hist_pct": [],
-        "oi_usd": None,
-        "long_short_ratio": 1.0,
-        "binance_netflow_24h": None,
-        "binance_notes": [],
-        "xrp_btc": None,
-        "xrp_eth": None,
-        "xrpl_raw_inflow": 0.0,
-        "xrpl_weighted_inflow": 0.0,
-        "xrpl_ripple_otc": 0.0,
-    }
+    result = empty_live_payload()
 
     # Price with Redis fallback and throttled CoinGecko usage, then Binance/CryptoCompare
     price_resp = cached_coingecko_simple_price("ripple")
@@ -651,16 +657,26 @@ def fetch_live():
     weighted_sum = 0.0
     ripple_otc = 0.0
 
-    for f in inflows:
-        try:
-            amt = float(f.get("xrp", 0.0))
-            w = float(f.get("weight", 1.0))
-            raw_sum += amt
-            weighted_sum += amt * w
-            if f.get("ripple_corp"):
-                ripple_otc += amt
-        except Exception:
-            continue
+    if inflows:
+        for f in inflows:
+            try:
+                amt = float(f.get("xrp", 0.0))
+                w = float(f.get("weight", 1.0))
+                raw_sum += amt
+                weighted_sum += amt * w
+                if f.get("ripple_corp"):
+                    ripple_otc += amt
+            except Exception:
+                continue
+    else:
+        history = cache_get_json("xrpl:inflow_history")
+        if isinstance(history, list) and history:
+            last = history[-1]
+            try:
+                raw_sum = float(last.get("total_xrp", 0.0))
+                weighted_sum = float(last.get("weighted_xrp", 0.0))
+            except Exception:
+                raw_sum = weighted_sum = 0.0
 
     result["xrpl_raw_inflow"] = raw_sum
     result["xrpl_weighted_inflow"] = weighted_sum
@@ -669,7 +685,10 @@ def fetch_live():
     return result
 
 
-live = fetch_live()
+if os.getenv("SKIP_LIVE_FETCH") == "1":
+    live = empty_live_payload()
+else:
+    live = fetch_live()
 
 # =========================
 # News sentiment from Redis + EMA

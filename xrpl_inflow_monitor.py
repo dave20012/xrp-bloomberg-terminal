@@ -38,13 +38,29 @@ RIPPLE_DATA_REQUEST_INTERVAL = float(os.getenv("RIPPLE_DATA_REQUEST_INTERVAL", "
 WHALE_ALERT_KEY = os.getenv("WHALE_ALERT_KEY")
 ENV_PROVIDER = os.getenv("XRPL_INFLOWS_PROVIDER", "whale_alert").lower()
 PROVIDER = ENV_PROVIDER
-RUN = int(os.getenv("XRPL_INFLOWS_INTERVAL", "600"))  # 10m default
+
+
+def _read_poll_interval() -> int:
+    """Read the XRPL poll interval, supporting legacy + documented env vars."""
+
+    poll_env = os.getenv("XRPL_POLL_SECONDS")
+    legacy_env = os.getenv("XRPL_INFLOWS_INTERVAL")
+
+    if poll_env:
+        return int(poll_env)
+    if legacy_env:
+        return int(legacy_env)
+    return 600
+
+
+RUN = _read_poll_interval()  # 10m default
 MIN_XRP = float(os.getenv("XRPL_MIN_XRP", "10000000"))
 LOOKBACK_SECONDS = int(os.getenv("XRPL_LOOKBACK_SECONDS", str(max(RUN * 2, 900))))
 
 _missing_key_info_logged = False
 ripple_data_cooldown_until = 0.0
 ripple_data_failure_streak = 0
+ripple_data_blocked_addresses: Set[str] = set()
 _rpc_endpoint_index = 0
 
 
@@ -139,9 +155,16 @@ def parse_timestamp(date_str: str) -> int:
 
 
 def monitored_addresses() -> Set[str]:
+    """Return sanitized exchange addresses to monitor."""
+
     addrs: Set[str] = set()
     for lst in EXCHANGE_ADDRESSES.values():
-        addrs.update(lst)
+        for addr in lst:
+            if not addr:
+                continue
+            addr_clean = addr.strip()
+            if addr_clean:
+                addrs.add(addr_clean)
     return addrs
 
 
@@ -331,6 +354,9 @@ def fetch_transactions_ripple_data() -> List[Dict]:
         return fetch_transactions_rippled_rpc()
 
     for address in monitored_addresses():
+        if address in ripple_data_blocked_addresses:
+            logging.debug("Skipping Ripple Data address %s previously blocked after 403", address)
+            continue
         try:
             resp = requests.get(
                 RIPPLE_DATA_API.format(address=address),
@@ -344,24 +370,13 @@ def fetch_transactions_ripple_data() -> List[Dict]:
                 timeout=15,
             )
             if resp.status_code == 403:
-                ripple_data_failure_streak = min(ripple_data_failure_streak + 1, 10)
-                cooldown_seconds = min(
-                    RIPPLE_DATA_COOLDOWN_SECONDS * (2 ** (ripple_data_failure_streak - 1)),
-                    RIPPLE_DATA_MAX_COOLDOWN_SECONDS,
-                )
-                ripple_data_cooldown_until = time.time() + cooldown_seconds
+                ripple_data_blocked_addresses.add(address)
                 logging.warning(
-                    "Ripple Data API returned 403 for %s; halting further XRPL inflow requests for %.0fs (failure streak: %d)",
+                    "Ripple Data API returned 403 for %s; removing from inflow polling set for this run",
                     address,
-                    cooldown_seconds,
-                    ripple_data_failure_streak,
                 )
-                cached = fetch_cached_flows()
-                if cached:
-                    logging.info("Serving cached XRPL inflows during Ripple Data cooldown")
-                    return cached
-                logging.info("No cached inflows; attempting rippled RPC fallback after Ripple Data 403")
-                return fetch_transactions_rippled_rpc()
+                time.sleep(RIPPLE_DATA_REQUEST_INTERVAL)
+                continue
             if not resp.ok:
                 logging.warning(f"Ripple Data API error {resp.status_code} for {address}")
                 time.sleep(RIPPLE_DATA_REQUEST_INTERVAL)

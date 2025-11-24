@@ -1,3 +1,4 @@
+import os
 import unittest
 from unittest import mock
 
@@ -93,6 +94,91 @@ class FetchTransactionsTests(unittest.TestCase):
         for flow in flows:
             self.assertIn("xrp", flow)
             self.assertIn("exchange", flow)
+
+
+class PollIntervalEnvTests(unittest.TestCase):
+    def setUp(self):
+        self._orig_poll = os.environ.get("XRPL_POLL_SECONDS")
+        self._orig_legacy = os.environ.get("XRPL_INFLOWS_INTERVAL")
+
+    def tearDown(self):
+        if self._orig_poll is None:
+            os.environ.pop("XRPL_POLL_SECONDS", None)
+        else:
+            os.environ["XRPL_POLL_SECONDS"] = self._orig_poll
+
+        if self._orig_legacy is None:
+            os.environ.pop("XRPL_INFLOWS_INTERVAL", None)
+        else:
+            os.environ["XRPL_INFLOWS_INTERVAL"] = self._orig_legacy
+
+        import importlib
+
+        import xrpl_inflow_monitor as monitor
+
+        importlib.reload(monitor)
+
+    def test_prefers_documented_poll_env(self):
+        import importlib
+
+        with mock.patch.dict(
+            os.environ,
+            {"XRPL_POLL_SECONDS": "45", "XRPL_INFLOWS_INTERVAL": "600"},
+        ):
+            import xrpl_inflow_monitor as monitor
+
+            reloaded = importlib.reload(monitor)
+
+        self.assertEqual(reloaded.RUN, 45)
+
+
+class RippleData403HandlingTests(unittest.TestCase):
+    def setUp(self):
+        monitor.ripple_data_blocked_addresses.clear()
+        monitor.ripple_data_cooldown_until = 0
+
+    def test_monitored_addresses_strip_whitespace(self):
+        with mock.patch.object(
+            monitor,
+            "EXCHANGE_ADDRESSES",
+            {"Sample": [" r123 ", "", "r456"]},
+        ):
+            self.assertEqual(monitor.monitored_addresses(), {"r123", "r456"})
+
+    def test_403_blocks_address_without_global_cooldown(self):
+        monitor.ripple_data_blocked_addresses.clear()
+        monitor.ripple_data_cooldown_until = 0
+
+        good_response = mock.Mock(
+            status_code=200,
+            ok=True,
+            json=lambda: {
+                "transactions": [
+                    {
+                        "tx": {
+                            "Destination": "good",
+                            "Amount": str(int((monitor.MIN_XRP + 1) * 1_000_000)),
+                            "Account": "src",
+                        },
+                        "date": "2025-01-01T00:00:00Z",
+                    }
+                ]
+            },
+        )
+
+        with mock.patch(
+            "xrpl_inflow_monitor.monitored_addresses", return_value=["bad", "good"]
+        ), mock.patch("xrpl_inflow_monitor.requests.get") as mock_get, mock.patch(
+            "xrpl_inflow_monitor.time.sleep"
+        ) as mock_sleep:
+            mock_get.side_effect = [mock.Mock(status_code=403, ok=False), good_response]
+            flows = monitor.fetch_transactions_ripple_data()
+
+        self.assertIn("bad", monitor.ripple_data_blocked_addresses)
+        self.assertEqual(monitor.ripple_data_cooldown_until, 0)
+        self.assertEqual(len(flows), 1)
+        self.assertEqual(flows[0].get("to_address"), "good")
+        mock_sleep.assert_called()
 
 
 if __name__ == "__main__":
