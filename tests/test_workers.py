@@ -2,7 +2,13 @@ import json
 import unittest
 
 from redis_client import rdb
-from sentiment_worker import dedupe_headlines, read_sentiment_ema, write_sentiment_ema
+from sentiment_worker import (
+    dedupe_headlines,
+    normalize_titles,
+    read_cached_headlines,
+    read_sentiment_ema,
+    write_sentiment_ema,
+)
 from xrpl_inflow_monitor import append_history
 
 
@@ -65,6 +71,28 @@ class SentimentHeadlineTests(unittest.TestCase):
 
         self.assertEqual(len(deduped), 2)
         self.assertEqual(deduped[0]["source"], "A")
+
+    def test_cached_headlines_read_and_normalization(self):
+        clear_cache()
+
+        payload = {
+            "timestamp": "2025-11-24T00:00:00Z",
+            "score": 0.1,
+            "count": 2,
+            "mode": "weighted_all",
+            "articles": [
+                {"source": "A", "title": "XRP rallies"},
+                {"source": "B", "title": "XRP    rallies "},
+            ],
+        }
+
+        rdb.set("news:sentiment", json.dumps(payload))
+
+        cached = read_cached_headlines()
+        normalized_payload = normalize_titles(payload["articles"])
+
+        self.assertEqual(cached, normalized_payload)
+        self.assertEqual(len(cached), 1)
 
 
 if __name__ == "__main__":

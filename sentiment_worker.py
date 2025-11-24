@@ -130,6 +130,22 @@ def dedupe_headlines(items):
     return unique
 
 
+def normalize_titles(items):
+    """Return a set of normalized titles from an iterable of article dicts."""
+
+    titles = set()
+
+    for a in items:
+        title = (a.get("title") or "").strip()
+        if not title:
+            continue
+
+        normalized = re.sub(r"\s+", " ", title).lower()
+        titles.add(normalized)
+
+    return titles
+
+
 # ===================== Fetch Headlines ===========================
 
 def fetch_headlines():
@@ -275,6 +291,25 @@ def write_sentiment_ema(value: float):
         logging.error(f"Sentiment EMA write failed: {e}")
 
 
+def read_cached_headlines():
+    """Return normalized titles from the last sentiment payload, if available."""
+
+    try:
+        raw = rdb.get("news:sentiment")
+        if not raw:
+            return None
+
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+
+        obj = json.loads(raw)
+        arts = obj.get("articles", [])
+        return normalize_titles(arts)
+    except Exception as e:
+        logging.warning(f"Cached headline read failed: {e}")
+    return None
+
+
 # ======================= Main Routine =============================
 
 def run_once():
@@ -293,6 +328,13 @@ def run_once():
 
     if not filtered:
         push({"timestamp": ts(), "score": 0.0, "count": 0, "mode": "weighted_all", "articles": []})
+        return
+
+    cached_titles = read_cached_headlines()
+    current_titles = normalize_titles(filtered)
+
+    if cached_titles is not None and current_titles and cached_titles == current_titles:
+        logging.info("Headlines unchanged from last run; skipping duplicate scoring.")
         return
 
     random.shuffle(filtered)
