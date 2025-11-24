@@ -88,11 +88,23 @@ def describe_data_health(live: Dict[str, Any], news_payload: Dict[str, Any]) -> 
     if sentiment_count == 0:
         issues.append("News sentiment missing")
         redis_notes.append("Redis key `news:sentiment` not found or empty.")
+        if cache_get_json("news:sentiment_ema") is None:
+            redis_notes.append("Redis key `news:sentiment_ema` missing (sentiment EMA fallback unavailable).")
 
     if (live.get("xrpl_weighted_inflow") or 0.0) == 0:
         redis_notes.append("Redis key `xrpl:latest_inflows` empty or stale.")
 
+    if cache_get_json("xrpl:inflow_history") is None:
+        redis_notes.append("Redis key `xrpl:inflow_history` missing; inflow history charts may be empty.")
+
     if live.get("price") is None and cache_get_json("cache:price:xrp_usd"):
         redis_notes.append("Using cached price from `cache:price:xrp_usd`.")
+
+    missing_ratio_emas = [
+        name for name in ("xrp_btc", "xrp_eth") if cache_get_json(f"ratio_ema:{name}") is None
+    ]
+    if missing_ratio_emas:
+        formatted = ", ".join(f"`ratio_ema:{name}`" for name in missing_ratio_emas)
+        redis_notes.append(f"Ratio EMA cache missing ({formatted}); rebuilding baselines from live data.")
 
     return issues, redis_notes

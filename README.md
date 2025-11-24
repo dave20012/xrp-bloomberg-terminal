@@ -12,6 +12,7 @@ Streamlit dashboard with supporting workers that surface XRP price action, XRPL 
   - `xrpl:latest_inflows` – most recent XRPL inflow slice.
   - `xrpl:inflow_history` – rolling inflow history for charts/analytics.
   - `cache:price:xrp_usd` – price fallback when APIs are unavailable.
+  - `ratio_ema:xrp_btc`, `ratio_ema:xrp_eth` – cached EMA baselines for flippening ratios.
 
 ## Quick start (local)
 1. Create a virtual environment and install deps:
