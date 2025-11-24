@@ -86,6 +86,14 @@ class FetchTransactionsTests(unittest.TestCase):
         mock_fetch.assert_called_once()
         mock_cached.assert_called_once()
 
+    def test_sample_flows_provide_structured_payload(self):
+        flows = monitor.sample_flows()
+
+        self.assertGreaterEqual(len(flows), 2)
+        for flow in flows:
+            self.assertIn("xrp", flow)
+            self.assertIn("exchange", flow)
+
 
 if __name__ == "__main__":
     unittest.main()
