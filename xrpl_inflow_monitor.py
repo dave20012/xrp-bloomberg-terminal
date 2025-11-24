@@ -20,6 +20,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 
 WHALE_ALERT_API = "https://api.whale-alert.io/v1/transactions"
 RIPPLE_DATA_API = "https://data.ripple.com/v2/accounts/{address}/transactions"
+RIPPLE_DATA_HEADERS = {"User-Agent": "xrpl-inflow-monitor/1.0", "Accept": "application/json"}
 
 WHALE_ALERT_KEY = os.getenv("WHALE_ALERT_KEY")
 ENV_PROVIDER = os.getenv("XRPL_INFLOWS_PROVIDER", "whale_alert").lower()
@@ -145,10 +146,18 @@ def fetch_transactions_ripple_data() -> List[Dict]:
                     "limit": 50,
                     "start": start_str,
                 },
+                headers=RIPPLE_DATA_HEADERS,
                 timeout=15,
             )
+            if resp.status_code == 403:
+                logging.warning(
+                    "Ripple Data API returned 403 for %s; halting further XRPL inflow requests to avoid bans",
+                    address,
+                )
+                break
             if not resp.ok:
                 logging.warning(f"Ripple Data API error {resp.status_code} for {address}")
+                time.sleep(0.25)
                 continue
 
             data = resp.json()
@@ -189,6 +198,7 @@ def fetch_transactions_ripple_data() -> List[Dict]:
                         "ripple_corp": ripple_corp,
                     }
                 )
+            time.sleep(0.25)
         except Exception as e:
             logging.error(f"Ripple Data fetch failed for {address}: {e}")
 

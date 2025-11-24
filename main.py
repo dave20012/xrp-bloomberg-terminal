@@ -6,7 +6,7 @@ import os
 import hmac
 import hashlib
 import time
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode
 
 import json
@@ -129,8 +129,53 @@ def read_ratio_ema(name: str):
 def write_ratio_ema(name: str, value: float):
     cache_set_json(
         f"ratio_ema:{name}",
-        {"ema": float(value), "timestamp": datetime.utcnow().isoformat() + "Z"},
+        {"ema": float(value), "timestamp": datetime.now(timezone.utc).isoformat()},
     )
+
+
+def read_cached_binance_netflow():
+    obj = cache_get_json("cache:binance_netflow_24h")
+    if not isinstance(obj, dict):
+        return None, None
+    try:
+        val = float(obj.get("value", 0.0))
+    except Exception:
+        return None, obj.get("ts")
+    return val, obj.get("ts")
+
+
+def append_binance_netflow_history(value: float, ts: str, max_len: int = 120) -> None:
+    history = cache_get_json("cache:binance_netflow_hist")
+    if not isinstance(history, list):
+        history = []
+
+    entry_date = ts.split("T")[0]
+
+    # Skip if last entry already represents this date + value
+    if history:
+        last = history[-1]
+        if (
+            last.get("date") == entry_date
+            and abs(float(last.get("value", 0.0)) - float(value)) < 1e-9
+        ):
+            return
+
+    history.append({"date": entry_date, "value": float(value), "ts": ts})
+    history = history[-max_len:]
+    cache_set_json("cache:binance_netflow_hist", history)
+
+
+def write_cached_binance_netflow(value: float):
+    ts = datetime.now(timezone.utc).isoformat()
+    cache_set_json("cache:binance_netflow_24h", {"value": float(value), "ts": ts})
+    append_binance_netflow_history(value, ts)
+
+
+def _parse_ts(ts: str):
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except Exception:
+        return None
 
 
 # =========================
@@ -154,7 +199,7 @@ def fetch_live():
         "funding_hist_pct": [],
         "oi_usd": None,
         "long_short_ratio": 1.0,
-        "binance_netflow_24h": 0.0,
+        "binance_netflow_24h": None,
         "xrp_btc": None,
         "xrp_eth": None,
         "xrpl_raw_inflow": 0.0,
@@ -250,9 +295,24 @@ def fetch_live():
             pass
 
     # Binance signed netflow (XRP)
+    cached_netflow_val, cached_netflow_ts = read_cached_binance_netflow()
+    cached_recent = False
+    if cached_netflow_ts:
+        parsed_ts = _parse_ts(cached_netflow_ts)
+        if parsed_ts and datetime.now(timezone.utc) - parsed_ts < timedelta(hours=23):
+            cached_recent = True
+            if cached_netflow_val is not None:
+                result["binance_netflow_24h"] = cached_netflow_val
+
     api_key = os.getenv("BINANCE_API_KEY")
     api_secret = os.getenv("BINANCE_API_SECRET")
-    if api_key and api_secret and api_key.strip() and api_secret.strip():
+    if (
+        api_key
+        and api_secret
+        and api_key.strip()
+        and api_secret.strip()
+        and not cached_recent
+    ):
         try:
             ts_ms = int(time.time() * 1000)
             start = ts_ms - 86_400_000  # 24h
@@ -267,8 +327,8 @@ def fetch_live():
             dep_url = f"{base}/sapi/v1/capital/deposit/hisrec?{query_string}&signature={signature}"
             wd_url = f"{base}/sapi/v1/capital/withdraw/history?{query_string}&signature={signature}"
 
-            dep = safe_get(dep_url, None)
-            wd = safe_get(wd_url, None)
+            dep = safe_get(dep_url, None, headers=headers)
+            wd = safe_get(wd_url, None, headers=headers)
             dep = dep or []
             wd = wd or []
 
@@ -279,9 +339,17 @@ def fetch_live():
                 if w.get("status") == 6
             )
             # positive = more withdrawals (coins leaving Binance)
-            result["binance_netflow_24h"] = wd_amt - dep_amt
+            netflow_val = wd_amt - dep_amt
+            result["binance_netflow_24h"] = netflow_val
+            write_cached_binance_netflow(netflow_val)
         except Exception:
             pass
+
+    if result["binance_netflow_24h"] is None:
+        if cached_netflow_val is not None:
+            result["binance_netflow_24h"] = cached_netflow_val
+        else:
+            result["binance_netflow_24h"] = 0.0
 
     # XRPL inflows (from Redis, new v9.3 schema)
     try:
@@ -348,7 +416,7 @@ def read_sentiment_ema():
 def write_sentiment_ema(value: float):
     cache_set_json(
         "news:sentiment_ema",
-        {"ema": float(value), "timestamp": datetime.utcnow().isoformat() + "Z"},
+        {"ema": float(value), "timestamp": datetime.now(timezone.utc).isoformat()},
     )
 
 
