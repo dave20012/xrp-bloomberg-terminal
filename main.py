@@ -53,7 +53,13 @@ if not logger.handlers:
 def normalize_env_value(name: str) -> str:
     """Return a trimmed environment variable (blank string if missing)."""
 
-    return (os.getenv(name) or "").strip()
+    raw = (os.getenv(name) or "").strip()
+
+    # Railway variables sometimes get pasted with surrounding quotes.
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {'"', "'"}:
+        raw = raw[1:-1].strip()
+
+    return raw
 
 
 def validate_binance_credentials(api_key: str, api_secret: str) -> Optional[str]:
@@ -464,8 +470,8 @@ def fetch_live():
             dep_url = f"{base}/sapi/v1/capital/deposit/hisrec?{query_string}&signature={signature}"
             wd_url = f"{base}/sapi/v1/capital/withdraw/history?{query_string}&signature={signature}"
 
-            dep = safe_get(dep_url, None)
-            wd = safe_get(wd_url, None)
+            dep = safe_get(dep_url, None, headers=headers)
+            wd = safe_get(wd_url, None, headers=headers)
             dep = dep or []
             wd = wd or []
 

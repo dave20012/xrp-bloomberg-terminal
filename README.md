@@ -61,7 +61,7 @@ Streamlit dashboard with supporting workers that surface XRP price action, XRPL 
    - Worker logs show XRPL inflow and sentiment polling runs.
 6. Verify Redis keys are populated (`news:sentiment`, `xrpl:latest_inflows`, `xrpl:inflow_history`).
 
-> **Binance key format:** paste the raw `API Key` and `Secret Key` strings from the Binance dashboard. Do **not** include `${{ }}` wrappers, quotes, or trailing spaces—formatted CI placeholders will be rejected by Binance with `API-key format invalid`.
+> **Binance key format:** paste the raw `API Key` and `Secret Key` strings from the Binance dashboard. Do **not** include `${{ }}` wrappers, quotes, or trailing spaces—formatted CI placeholders will be rejected by Binance with `API-key format invalid`. The app trims accidental surrounding quotes, but storing the bare values in Railway variables avoids silent authentication failures.
 
 ## Configuration & security notes
 - Use `.env` (based on `.env.example`) locally and Railway project variables in production.
