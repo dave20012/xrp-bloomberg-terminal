@@ -38,7 +38,22 @@ RIPPLE_DATA_REQUEST_INTERVAL = float(os.getenv("RIPPLE_DATA_REQUEST_INTERVAL", "
 WHALE_ALERT_KEY = os.getenv("WHALE_ALERT_KEY")
 ENV_PROVIDER = os.getenv("XRPL_INFLOWS_PROVIDER", "whale_alert").lower()
 PROVIDER = ENV_PROVIDER
-RUN = int(os.getenv("XRPL_INFLOWS_INTERVAL", "600"))  # 10m default
+
+
+def _read_poll_interval() -> int:
+    """Read the XRPL poll interval, supporting legacy + documented env vars."""
+
+    poll_env = os.getenv("XRPL_POLL_SECONDS")
+    legacy_env = os.getenv("XRPL_INFLOWS_INTERVAL")
+
+    if poll_env:
+        return int(poll_env)
+    if legacy_env:
+        return int(legacy_env)
+    return 600
+
+
+RUN = _read_poll_interval()  # 10m default
 MIN_XRP = float(os.getenv("XRPL_MIN_XRP", "10000000"))
 LOOKBACK_SECONDS = int(os.getenv("XRPL_LOOKBACK_SECONDS", str(max(RUN * 2, 900))))
 

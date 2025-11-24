@@ -1,3 +1,4 @@
+import os
 import unittest
 from unittest import mock
 
@@ -93,6 +94,42 @@ class FetchTransactionsTests(unittest.TestCase):
         for flow in flows:
             self.assertIn("xrp", flow)
             self.assertIn("exchange", flow)
+
+
+class PollIntervalEnvTests(unittest.TestCase):
+    def setUp(self):
+        self._orig_poll = os.environ.get("XRPL_POLL_SECONDS")
+        self._orig_legacy = os.environ.get("XRPL_INFLOWS_INTERVAL")
+
+    def tearDown(self):
+        if self._orig_poll is None:
+            os.environ.pop("XRPL_POLL_SECONDS", None)
+        else:
+            os.environ["XRPL_POLL_SECONDS"] = self._orig_poll
+
+        if self._orig_legacy is None:
+            os.environ.pop("XRPL_INFLOWS_INTERVAL", None)
+        else:
+            os.environ["XRPL_INFLOWS_INTERVAL"] = self._orig_legacy
+
+        import importlib
+
+        import xrpl_inflow_monitor as monitor
+
+        importlib.reload(monitor)
+
+    def test_prefers_documented_poll_env(self):
+        import importlib
+
+        with mock.patch.dict(
+            os.environ,
+            {"XRPL_POLL_SECONDS": "45", "XRPL_INFLOWS_INTERVAL": "600"},
+        ):
+            import xrpl_inflow_monitor as monitor
+
+            reloaded = importlib.reload(monitor)
+
+        self.assertEqual(reloaded.RUN, 45)
 
 
 if __name__ == "__main__":
