@@ -44,6 +44,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 NEWS_KEY = os.getenv("NEWS_API_KEY")
 HF_TOKEN = os.getenv("HF_TOKEN")
 RUN_INTERVAL = int(os.getenv("SENTIMENT_RUN_INTERVAL", "1800"))  # 30m default
+SENTIMENT_EMA_ALPHA = float(os.getenv("SENTIMENT_EMA_ALPHA", "0.3"))
 
 # ===================== Source Weight Map =========================
 
@@ -220,6 +221,29 @@ def push(payload):
         logging.error(f"Redis push failed: {e}")
 
 
+def read_sentiment_ema():
+    try:
+        raw = rdb.get("news:sentiment_ema")
+        if raw:
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            obj = json.loads(raw)
+            return float(obj.get("ema", 0.0))
+    except Exception as e:
+        logging.warning(f"Sentiment EMA read failed: {e}")
+    return None
+
+
+def write_sentiment_ema(value: float):
+    try:
+        rdb.set(
+            "news:sentiment_ema",
+            json.dumps({"ema": float(value), "timestamp": ts()}),
+        )
+    except Exception as e:
+        logging.error(f"Sentiment EMA write failed: {e}")
+
+
 # ======================= Main Routine =============================
 
 def run_once():
@@ -277,6 +301,11 @@ def run_once():
         time.sleep(0.22)
 
     final = weighted_trimmed_mean(scalar_scores, weights)
+
+    prev_ema = read_sentiment_ema()
+    ema_sent = final if prev_ema is None else SENTIMENT_EMA_ALPHA * final + (1.0 - SENTIMENT_EMA_ALPHA) * prev_ema
+
+    write_sentiment_ema(ema_sent)
 
     push(
         {

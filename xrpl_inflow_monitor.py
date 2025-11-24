@@ -6,6 +6,7 @@
 
 import json
 import logging
+from datetime import datetime, timezone
 import os
 import time
 from typing import Dict, List, Set
@@ -246,8 +247,33 @@ def push(flows):
     try:
         rdb.set("xrpl:latest_inflows", json.dumps(flows))
         logging.info(f"XRPL inflows snapshot pushed: {len(flows)} txs")
+        append_history(flows)
     except Exception as e:
         logging.error(f"XRPL inflows push failed: {e}")
+
+
+def append_history(flows, max_len: int = 240):
+    snapshot = {
+        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "total_xrp": float(sum(f.get("xrp", 0.0) for f in flows)),
+        "weighted_xrp": float(sum(f.get("xrp", 0.0) * f.get("weight", 1.0) for f in flows)),
+    }
+
+    try:
+        raw = rdb.get("xrpl:inflow_history")
+        history = json.loads(raw) if raw else []
+        if not isinstance(history, list):
+            history = []
+    except Exception:
+        history = []
+
+    history.append(snapshot)
+    history = history[-max_len:]
+
+    try:
+        rdb.set("xrpl:inflow_history", json.dumps(history))
+    except Exception as e:
+        logging.error(f"XRPL inflow history write failed: {e}")
 
 
 def loop():
