@@ -1,5 +1,6 @@
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -91,7 +92,21 @@ def describe_data_health(live: Dict[str, Any], news_payload: Dict[str, Any]) -> 
         if cache_get_json("news:sentiment_ema") is None:
             redis_notes.append("Redis key `news:sentiment_ema` missing (sentiment EMA fallback unavailable).")
 
-    if (live.get("xrpl_weighted_inflow") or 0.0) == 0:
+    xrpl_meta = cache_get_json("xrpl:latest_inflows_meta")
+    xrpl_fresh = False
+    if isinstance(xrpl_meta, dict):
+        ts_raw = xrpl_meta.get("updated_at")
+        run_seconds = int(xrpl_meta.get("run_seconds") or 600)
+        try:
+            ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00")) if ts_raw else None
+        except Exception:  # noqa: BLE001
+            ts = None
+
+        if ts:
+            grace = max(run_seconds * 3, 900)  # tolerate temporary outages
+            xrpl_fresh = datetime.now(timezone.utc) - ts <= timedelta(seconds=grace)
+
+    if cache_get_json("xrpl:latest_inflows") is None or not xrpl_fresh:
         redis_notes.append("Redis key `xrpl:latest_inflows` empty or stale.")
 
     if cache_get_json("xrpl:inflow_history") is None:
