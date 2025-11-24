@@ -4,11 +4,12 @@
 # - ripple_corp (Ripple treasury -> exchange)
 # Pushes latest snapshot to Redis under "xrpl:latest_inflows"
 
+import argparse
 import json
 import logging
-from datetime import datetime, timezone
 import os
 import time
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set
 
 import requests
@@ -549,15 +550,62 @@ def append_history(flows, max_len: int = 240):
         logging.error(f"XRPL inflow history write failed: {e}")
 
 
-def loop():
+def sample_flows() -> List[Dict]:
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return [
+        {
+            "timestamp": now,
+            "xrp": 2_000_000,
+            "exchange": "binance",
+            "to_address": "sample_binance", 
+            "from_address": "sample_wallet_a",
+            "to_owner": "Binance",
+            "from_owner": "",
+            "weight": exchange_weight("binance"),
+            "ripple_corp": False,
+            "txid": "sample-binance",
+        },
+        {
+            "timestamp": now,
+            "xrp": 750_000,
+            "exchange": "kraken",
+            "to_address": "sample_kraken",
+            "from_address": "sample_wallet_b",
+            "to_owner": "Kraken",
+            "from_owner": "",
+            "weight": exchange_weight("kraken"),
+            "ripple_corp": False,
+            "txid": "sample-kraken",
+        },
+    ]
+
+
+def loop(use_sample: bool = False):
     while True:
         try:
-            flows = build_flows()
+            flows = sample_flows() if use_sample else build_flows()
             push(flows)
         except Exception as e:
             logging.error(f"XRPL inflow loop error: {e}")
         time.sleep(RUN)
 
 
+def main():
+    parser = argparse.ArgumentParser(description="XRPL inflow monitor")
+    parser.add_argument("--once", action="store_true", help="Run a single iteration")
+    parser.add_argument(
+        "--sample",
+        action="store_true",
+        help="Use built-in sample inflow events (no network calls)",
+    )
+    args = parser.parse_args()
+
+    if args.once:
+        flows = sample_flows() if args.sample else build_flows()
+        push(flows)
+    else:
+        loop(use_sample=args.sample)
+
+
 if __name__ == "__main__":
-    loop()
+    main()

@@ -7,6 +7,7 @@ from sentiment_worker import (
     normalize_titles,
     read_cached_headlines,
     read_sentiment_ema,
+    run_once,
     write_sentiment_ema,
 )
 from xrpl_inflow_monitor import append_history
@@ -93,6 +94,18 @@ class SentimentHeadlineTests(unittest.TestCase):
 
         self.assertEqual(cached, normalized_payload)
         self.assertEqual(len(cached), 1)
+
+    def test_run_once_sample_path(self):
+        clear_cache()
+
+        run_once(use_sample=True)
+
+        raw = rdb.get("news:sentiment")
+        self.assertIsNotNone(raw)
+        payload = json.loads(raw)
+
+        self.assertEqual(payload["count"], 4)
+        self.assertTrue(all(article.get("scalar") is not None for article in payload["articles"]))
 
 
 if __name__ == "__main__":

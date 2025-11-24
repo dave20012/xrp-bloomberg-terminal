@@ -26,12 +26,13 @@
 #     }
 # in Redis under key "news:sentiment"
 
-import os
-import time
+import argparse
 import json
+import logging
+import os
 import random
 import re
-import logging
+import time
 from datetime import datetime, timezone
 
 import numpy as np
@@ -312,17 +313,25 @@ def read_cached_headlines():
 
 # ======================= Main Routine =============================
 
-def run_once():
-    arts_raw = fetch_headlines()
-    filtered = []
+def run_once(use_sample: bool = False):
+    if use_sample:
+        filtered = [
+            {"source": "Reuters", "title": "XRP adoption grows as enterprise pilots expand"},
+            {"source": "CoinDesk", "title": "XRP price dips on market volatility"},
+            {"source": "Bloomberg", "title": "Ripple secures new payment corridor"},
+            {"source": "Yahoo Finance", "title": "Analysts debate XRP long-term outlook"},
+        ]
+    else:
+        arts_raw = fetch_headlines()
+        filtered = []
 
-    for a in arts_raw:
-        src = a.get("source", {}).get("name", "") or ""
-        title = (a.get("title") or "").strip()
-        if clean_headline(title, src):
-            filtered.append({"source": src, "title": title})
+        for a in arts_raw:
+            src = a.get("source", {}).get("name", "") or ""
+            title = (a.get("title") or "").strip()
+            if clean_headline(title, src):
+                filtered.append({"source": src, "title": title})
 
-    filtered = dedupe_headlines(filtered)
+        filtered = dedupe_headlines(filtered)
 
     logging.info(f"Valid headlines: {len(filtered)}")
 
@@ -344,9 +353,14 @@ def run_once():
 
     consecutive_failures = 0
 
-    for a in filtered[:24]:  # cap per run
+    for idx, a in enumerate(filtered[:24]):  # cap per run
         w = source_weight(a["source"])
-        res = finbert(a["title"])
+
+        if use_sample:
+            pos, neg, neu = (0.55, 0.20, 0.25) if idx % 2 == 0 else (0.25, 0.55, 0.20)
+            res = (pos, neg, neu)
+        else:
+            res = finbert(a["title"])
 
         if res is not None:
             pos, neg, neu = res
@@ -377,13 +391,14 @@ def run_once():
             )
             consecutive_failures += 1
 
-        if consecutive_failures >= HF_FAIL_FAST:
+        if not use_sample and consecutive_failures >= HF_FAIL_FAST:
             logging.error(
                 f"Skipping remaining headlines after {consecutive_failures} consecutive FinBERT failures"
             )
             break
 
-        time.sleep(0.22)
+        if not use_sample:
+            time.sleep(0.22)
 
     final = weighted_trimmed_mean(scalar_scores, weights)
 
@@ -403,14 +418,30 @@ def run_once():
     )
 
 
-def run_loop():
+def run_loop(use_sample: bool = False):
     while True:
         try:
-            run_once()
+            run_once(use_sample=use_sample)
         except Exception as e:
             logging.error(f"Sentiment loop error: {e}")
         time.sleep(RUN_INTERVAL)
 
 
+def main():
+    parser = argparse.ArgumentParser(description="Sentiment worker")
+    parser.add_argument("--once", action="store_true", help="Run a single iteration")
+    parser.add_argument(
+        "--sample",
+        action="store_true",
+        help="Use built-in sample headlines and scores (no network calls)",
+    )
+    args = parser.parse_args()
+
+    if args.once:
+        run_once(use_sample=args.sample)
+    else:
+        run_loop(use_sample=args.sample)
+
+
 if __name__ == "__main__":
-    run_loop()
+    main()
