@@ -295,10 +295,22 @@ def fetch_live():
     api_secret = os.getenv("BINANCE_API_SECRET")
     if api_key and api_secret and api_key.strip() and api_secret.strip():
         try:
-            ts_ms = int(time.time() * 1000)
-            start = ts_ms - 86_400_000  # 24h
             base = "https://api.binance.com"
-            params = {"coin": "XRP", "startTime": start, "timestamp": ts_ms}
+
+            # Binance requires timestamp alignment; use server time when available
+            server_time_resp = safe_get(f"{base}/api/v3/time", None)
+            if server_time_resp and "serverTime" in server_time_resp:
+                ts_ms = int(server_time_resp["serverTime"])
+            else:
+                ts_ms = int(time.time() * 1000)
+
+            start = ts_ms - 86_400_000  # 24h
+            params = {
+                "coin": "XRP",
+                "startTime": start,
+                "timestamp": ts_ms,
+                "recvWindow": 60_000,
+            }
             query_string = urlencode(params)
             signature = hmac.new(
                 api_secret.encode(), query_string.encode(), hashlib.sha256
