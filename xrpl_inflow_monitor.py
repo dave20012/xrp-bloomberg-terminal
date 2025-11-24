@@ -766,6 +766,26 @@ def loop(use_sample: bool = False):
             push(flows, outflows)
         except Exception as e:
             logging.error(f"XRPL inflow loop error: {e}")
+
+            # Keep Redis warm with the last known snapshot so the dashboard
+            # doesn't show stale/missing inflow data when a single poll fails.
+            cached_in = fetch_cached_flows()
+            cached_out = fetch_cached_outflows() if MONITOR_OUTFLOWS else []
+            try:
+                if cached_in or cached_out:
+                    logging.info(
+                        "Re-publishing cached XRPL flows after failure (%s inflows, %s outflows)",
+                        len(cached_in),
+                        len(cached_out),
+                    )
+                    push(cached_in, cached_out)
+                else:
+                    logging.info(
+                        "No cached XRPL flows available after failure; pushing empty snapshot"
+                    )
+                    push([], [])
+            except Exception as push_err:
+                logging.error("Failed to push cached snapshot after error: %s", push_err)
         time.sleep(RUN)
 
 
