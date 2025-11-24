@@ -1,5 +1,4 @@
 import importlib
-import importlib
 import json
 import os
 import unittest
@@ -60,28 +59,6 @@ class FetchLiveInflowsTests(unittest.TestCase):
         self.assertAlmostEqual(live["xrpl_raw_inflow"], 1_500_000)
         self.assertAlmostEqual(live["xrpl_weighted_inflow"], 1_250_000)
         self.assertAlmostEqual(live["xrpl_ripple_otc"], 500_000)
-
-    def test_fetch_live_includes_outflows_and_net(self):
-        module = self._reload_main()
-
-        inflows = [{"xrp": 2_000_000, "weight": 1.0}]
-        outflows = [{"xrp": 500_000, "weight": 0.5}]
-        rdb.set("xrpl:latest_inflows", json.dumps(inflows))
-        rdb.set("xrpl:latest_outflows", json.dumps(outflows))
-
-        with mock.patch.object(
-            module, "cached_coingecko_simple_price", return_value={"ripple": {"usd": 0.5}}
-        ), mock.patch.object(
-            module, "cached_crypto_compare_price", return_value=0.5
-        ), mock.patch.object(
-            module, "safe_get", return_value=None
-        ):
-            live = module.fetch_live()
-
-        self.assertAlmostEqual(live["xrpl_raw_inflow"], 2_000_000)
-        self.assertAlmostEqual(live["xrpl_raw_outflow"], 500_000)
-        self.assertAlmostEqual(live["xrpl_netflow"], 1_500_000)
-        self.assertAlmostEqual(live["xrpl_weighted_outflow"], 250_000)
 
     def test_fetch_live_falls_back_to_history_when_latest_missing(self):
         module = self._reload_main()

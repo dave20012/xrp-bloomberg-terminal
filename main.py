@@ -112,9 +112,6 @@ def empty_live_payload() -> Dict[str, Any]:
         "xrpl_raw_inflow": 0.0,
         "xrpl_weighted_inflow": 0.0,
         "xrpl_ripple_otc": 0.0,
-        "xrpl_raw_outflow": 0.0,
-        "xrpl_weighted_outflow": 0.0,
-        "xrpl_netflow": 0.0,
     }
 
 
@@ -644,7 +641,7 @@ def fetch_live():
         else:
             result["binance_netflow_24h"] = 0.0
 
-    # XRPL inflows/outflows (from Redis, new v9.3 schema)
+    # XRPL inflows (from Redis, new v9.3 schema)
     try:
         raw = rdb.get("xrpl:latest_inflows")
         if raw:
@@ -656,22 +653,9 @@ def fetch_live():
     except Exception:
         inflows = []
 
-    try:
-        raw_out = rdb.get("xrpl:latest_outflows")
-        if raw_out:
-            if isinstance(raw_out, bytes):
-                raw_out = raw_out.decode("utf-8")
-            outflows = json.loads(raw_out)
-        else:
-            outflows = []
-    except Exception:
-        outflows = []
-
     raw_sum = 0.0
     weighted_sum = 0.0
     ripple_otc = 0.0
-    raw_out_sum = 0.0
-    weighted_out_sum = 0.0
 
     if inflows:
         for f in inflows:
@@ -694,31 +678,9 @@ def fetch_live():
             except Exception:
                 raw_sum = weighted_sum = 0.0
 
-    if outflows:
-        for f in outflows:
-            try:
-                amt = float(f.get("xrp", 0.0))
-                w = float(f.get("weight", 1.0))
-                raw_out_sum += amt
-                weighted_out_sum += amt * w
-            except Exception:
-                continue
-    else:
-        history_out = cache_get_json("xrpl:outflow_history")
-        if isinstance(history_out, list) and history_out:
-            last = history_out[-1]
-            try:
-                raw_out_sum = float(last.get("total_xrp", 0.0))
-                weighted_out_sum = float(last.get("weighted_xrp", 0.0))
-            except Exception:
-                raw_out_sum = weighted_out_sum = 0.0
-
     result["xrpl_raw_inflow"] = raw_sum
     result["xrpl_weighted_inflow"] = weighted_sum
     result["xrpl_ripple_otc"] = ripple_otc
-    result["xrpl_raw_outflow"] = raw_out_sum
-    result["xrpl_weighted_outflow"] = weighted_out_sum
-    result["xrpl_netflow"] = raw_sum - raw_out_sum
 
     return result
 
