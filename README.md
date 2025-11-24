@@ -4,14 +4,17 @@ Streamlit dashboard with supporting workers that surface XRP price action, XRPL 
 
 ## Architecture
 - **Web app (`main.py`)** pulls market data from CoinGecko (Binance fallback), funding/oi/netflow from Binance, and reads Redis for XRPL inflows plus sentiment. Plotly renders price/volume charts and SMA backtests.
-- **XRPL inflow worker (`xrpl_inflow_monitor.py`)** fetches on-chain activity from Ripple Data or Whale Alert and writes JSON payloads to Redis.
+- **XRPL inflow worker (`xrpl_inflow_monitor.py`)** fetches on-chain activity from Ripple Data or Whale Alert and writes JSON payloads to Redis (including optional exchange outflows).
 - **Sentiment worker (`sentiment_worker.py`)** calls News API + FinBERT (when HF_TOKEN provided) and stores article-level scores + EMA inputs in Redis.
 - **Shared Redis keys** keep the flows connected:
   - `news:sentiment` – latest sentiment payload written by the worker.
   - `news:sentiment_ema` – cached EMA used by the web app between refreshes.
   - `xrpl:latest_inflows` – most recent XRPL inflow slice.
   - `xrpl:latest_inflows_meta` – heartbeat describing the last inflow poll (timestamp/provider).
+  - `xrpl:latest_outflows` – most recent XRPL outflow slice (if enabled).
+  - `xrpl:latest_outflows_meta` – heartbeat describing the last outflow poll (timestamp/provider).
   - `xrpl:inflow_history` – rolling inflow history for charts/analytics.
+  - `xrpl:outflow_history` – rolling outflow history for charts/analytics.
   - `cache:price:xrp_usd` – price fallback when APIs are unavailable.
   - `ratio_ema:xrp_btc`, `ratio_ema:xrp_eth` – cached EMA baselines for flippening ratios.
 
@@ -46,12 +49,13 @@ Streamlit dashboard with supporting workers that surface XRP price action, XRPL 
    - `NEWS_API_KEY` (optional; sentiment worker)
    - `WHALE_ALERT_KEY` (required only if `XRPL_INFLOWS_PROVIDER=whale_alert`)
    - `XRPL_INFLOWS_PROVIDER` (`whale_alert` paid, `ripple_data` free, `rippled` RPC fallback)
-   - `XRPL_MIN_XRP` (optional threshold for inflow alerts, default 10,000,000 XRP)
+   - `XRPL_MIN_XRP` (optional threshold for inflow/outflow alerts, default 10,000,000 XRP)
+   - `XRPL_MONITOR_OUTFLOWS` (set to `0` to disable publishing exchange outflows; defaults to on)
    - `XRPL_LOOKBACK_SECONDS` (optional when using `ripple_data`; default max(RUN*2, 900))
    - `XRPL_RPC_ENDPOINTS` (comma-separated rippled JSON-RPC URLs; defaults to public s1/s2 endpoints)
    - `HF_TOKEN` (optional; FinBERT inference)
    - `META_REFRESH_SECONDS` (optional, default 45)
-   - `XRPL_POLL_SECONDS` (optional, default 30)
+   - `XRPL_POLL_SECONDS` (optional, default 30; `XRPL_INFLOWS_INTERVAL` still supported for backwards compatibility)
    - `SENTIMENT_RUN_INTERVAL` (optional override, default 1800 seconds)
 4. Railway will detect the Procfile and run:
    - `web`: Streamlit app

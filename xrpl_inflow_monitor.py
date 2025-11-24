@@ -10,7 +10,7 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 import requests
 
@@ -38,13 +38,34 @@ RIPPLE_DATA_REQUEST_INTERVAL = float(os.getenv("RIPPLE_DATA_REQUEST_INTERVAL", "
 WHALE_ALERT_KEY = os.getenv("WHALE_ALERT_KEY")
 ENV_PROVIDER = os.getenv("XRPL_INFLOWS_PROVIDER", "whale_alert").lower()
 PROVIDER = ENV_PROVIDER
-RUN = int(os.getenv("XRPL_INFLOWS_INTERVAL", "600"))  # 10m default
+
+
+def _read_poll_interval() -> int:
+    """Read the XRPL poll interval, supporting legacy + documented env vars."""
+
+    poll_env = os.getenv("XRPL_POLL_SECONDS")
+    legacy_env = os.getenv("XRPL_INFLOWS_INTERVAL")
+
+    if poll_env:
+        return int(poll_env)
+    if legacy_env:
+        return int(legacy_env)
+    return 600
+
+
+RUN = _read_poll_interval()  # 10m default
 MIN_XRP = float(os.getenv("XRPL_MIN_XRP", "10000000"))
+MONITOR_OUTFLOWS = (os.getenv("XRPL_MONITOR_OUTFLOWS", "1").strip() or "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 LOOKBACK_SECONDS = int(os.getenv("XRPL_LOOKBACK_SECONDS", str(max(RUN * 2, 900))))
 
 _missing_key_info_logged = False
 ripple_data_cooldown_until = 0.0
 ripple_data_failure_streak = 0
+ripple_data_blocked_addresses: Set[str] = set()
 _rpc_endpoint_index = 0
 
 
@@ -98,11 +119,11 @@ def exchange_weight(exchange: str) -> float:
     return float(EXCHANGE_WEIGHTS.get(exchange, 0.5))
 
 
-def fetch_transactions_whale_alert() -> List[Dict]:
-    """Fetch inflow transactions using Whale Alert (paid API)."""
+def fetch_transactions_whale_alert() -> Tuple[List[Dict], List[Dict]]:
+    """Fetch inflow/outflow transactions using Whale Alert (paid API)."""
     if not WHALE_ALERT_KEY:
         logging.warning("WHALE_ALERT_KEY missing.")
-        return []
+        return [], []
 
     price_usd = fetch_xrp_usd_price()
     if price_usd <= 0:
@@ -122,11 +143,11 @@ def fetch_transactions_whale_alert() -> List[Dict]:
         )
         if not r.ok:
             logging.warning(f"Whale Alert error: {r.status_code}")
-            return []
-        return r.json().get("transactions", [])
+            return [], []
+        return r.json().get("transactions", []), []
     except Exception as e:
         logging.error(f"Whale Alert fetch failed: {e}")
-        return []
+        return [], []
 
 
 def parse_timestamp(date_str: str) -> int:
@@ -139,9 +160,16 @@ def parse_timestamp(date_str: str) -> int:
 
 
 def monitored_addresses() -> Set[str]:
+    """Return sanitized exchange addresses to monitor."""
+
     addrs: Set[str] = set()
     for lst in EXCHANGE_ADDRESSES.values():
-        addrs.update(lst)
+        for addr in lst:
+            if not addr:
+                continue
+            addr_clean = addr.strip()
+            if addr_clean:
+                addrs.add(addr_clean)
     return addrs
 
 
@@ -187,10 +215,29 @@ def fetch_cached_flows() -> List[Dict]:
     return []
 
 
-def fetch_transactions_rippled_rpc() -> List[Dict]:
-    """Fetch inflows using public rippled JSON-RPC servers as a fallback provider."""
+def fetch_cached_outflows() -> List[Dict]:
+    """Return the last successful outflow snapshot from Redis (if available)."""
+
+    try:
+        raw = rdb.get("xrpl:latest_outflows")
+        if not raw:
+            return []
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return data
+    except Exception:
+        pass
+
+    return []
+
+
+def fetch_transactions_rippled_rpc() -> Tuple[List[Dict], List[Dict]]:
+    """Fetch inflows + optional outflows using public rippled JSON-RPC servers."""
 
     flows: List[Dict] = []
+    outflows: List[Dict] = []
     start = time.time() - LOOKBACK_SECONDS
 
     for address in monitored_addresses():
@@ -236,9 +283,6 @@ def fetch_transactions_rippled_rpc() -> List[Dict]:
                     continue
 
                 destination = tx.get("Destination", "")
-                if destination != address:
-                    continue
-
                 amt = tx.get("Amount")
                 if not isinstance(amt, (int, float, str)):
                     continue  # Ignore non-XRP payments
@@ -265,19 +309,35 @@ def fetch_transactions_rippled_rpc() -> List[Dict]:
                 canonical_ex = owner_from_address(address)
                 w = exchange_weight(canonical_ex)
 
-                flows.append(
-                    {
-                        "timestamp": ts,
-                        "xrp": xrp_amt,
-                        "exchange": canonical_ex,
-                        "to_address": address,
-                        "from_address": from_addr,
-                        "to_owner": canonical_ex,
-                        "from_owner": "",  # rippled RPC does not resolve owners
-                        "weight": w,
-                        "ripple_corp": ripple_corp,
-                    }
-                )
+                if destination == address:
+                    flows.append(
+                        {
+                            "timestamp": ts,
+                            "xrp": xrp_amt,
+                            "exchange": canonical_ex,
+                            "to_address": address,
+                            "from_address": from_addr,
+                            "to_owner": canonical_ex,
+                            "from_owner": "",  # rippled RPC does not resolve owners
+                            "weight": w,
+                            "ripple_corp": ripple_corp,
+                        }
+                    )
+
+                if MONITOR_OUTFLOWS and from_addr == address and destination:
+                    outflows.append(
+                        {
+                            "timestamp": ts,
+                            "xrp": xrp_amt,
+                            "exchange": canonical_ex,
+                            "to_address": destination,
+                            "from_address": from_addr,
+                            "to_owner": owner_from_address(destination),
+                            "from_owner": canonical_ex,
+                            "weight": w,
+                            "ripple_corp": False,
+                        }
+                    )
             time.sleep(RIPPLE_DATA_REQUEST_INTERVAL)
         except Exception as e:
             logging.error("rippled RPC fetch failed for %s via %s: %s", address, endpoint, e)
@@ -288,7 +348,13 @@ def fetch_transactions_rippled_rpc() -> List[Dict]:
         key = (f.get("from_address"), f.get("to_address"), f.get("timestamp"), f.get("xrp"))
         if key not in uniq:
             uniq[key] = f
-    return list(uniq.values())
+
+    uniq_out = {}
+    for f in outflows:
+        key = (f.get("from_address"), f.get("to_address"), f.get("timestamp"), f.get("xrp"))
+        if key not in uniq_out:
+            uniq_out[key] = f
+    return list(uniq.values()), list(uniq_out.values())
 
 
 def prefer_cached_when_empty(flows: List[Dict]) -> List[Dict]:
@@ -305,12 +371,27 @@ def prefer_cached_when_empty(flows: List[Dict]) -> List[Dict]:
     return []
 
 
-def fetch_transactions_ripple_data() -> List[Dict]:
-    """Fetch inflows to curated exchange addresses using Ripple Data (free)."""
+def prefer_cached_outflows(outflows: List[Dict]) -> List[Dict]:
+    """Return cached outflows when a polling run produced no data."""
+
+    if outflows:
+        return outflows
+
+    cached = fetch_cached_outflows()
+    if cached:
+        logging.info("Using cached XRPL outflows because fresh poll returned no data")
+        return cached
+
+    return []
+
+
+def fetch_transactions_ripple_data() -> Tuple[List[Dict], List[Dict]]:
+    """Fetch inflows/outflows to curated exchange addresses using Ripple Data (free)."""
 
     global ripple_data_failure_streak
 
     flows: List[Dict] = []
+    outflows: List[Dict] = []
     start = time.time() - LOOKBACK_SECONDS
     start_str = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start))
 
@@ -323,14 +404,18 @@ def fetch_transactions_ripple_data() -> List[Dict]:
             .isoformat()
             .replace("+00:00", "Z"),
         )
-        cached = fetch_cached_flows()
-        if cached:
-            return cached
+        cached_in = fetch_cached_flows()
+        cached_out = fetch_cached_outflows()
+        if cached_in or cached_out:
+            return cached_in, cached_out
 
         logging.info("Cached XRPL inflows unavailable; falling back to rippled RPC during Ripple Data cooldown")
         return fetch_transactions_rippled_rpc()
 
     for address in monitored_addresses():
+        if address in ripple_data_blocked_addresses:
+            logging.debug("Skipping Ripple Data address %s previously blocked after 403", address)
+            continue
         try:
             resp = requests.get(
                 RIPPLE_DATA_API.format(address=address),
@@ -344,24 +429,13 @@ def fetch_transactions_ripple_data() -> List[Dict]:
                 timeout=15,
             )
             if resp.status_code == 403:
-                ripple_data_failure_streak = min(ripple_data_failure_streak + 1, 10)
-                cooldown_seconds = min(
-                    RIPPLE_DATA_COOLDOWN_SECONDS * (2 ** (ripple_data_failure_streak - 1)),
-                    RIPPLE_DATA_MAX_COOLDOWN_SECONDS,
-                )
-                ripple_data_cooldown_until = time.time() + cooldown_seconds
+                ripple_data_blocked_addresses.add(address)
                 logging.warning(
-                    "Ripple Data API returned 403 for %s; halting further XRPL inflow requests for %.0fs (failure streak: %d)",
+                    "Ripple Data API returned 403 for %s; removing from inflow polling set for this run",
                     address,
-                    cooldown_seconds,
-                    ripple_data_failure_streak,
                 )
-                cached = fetch_cached_flows()
-                if cached:
-                    logging.info("Serving cached XRPL inflows during Ripple Data cooldown")
-                    return cached
-                logging.info("No cached inflows; attempting rippled RPC fallback after Ripple Data 403")
-                return fetch_transactions_rippled_rpc()
+                time.sleep(RIPPLE_DATA_REQUEST_INTERVAL)
+                continue
             if not resp.ok:
                 logging.warning(f"Ripple Data API error {resp.status_code} for {address}")
                 time.sleep(RIPPLE_DATA_REQUEST_INTERVAL)
@@ -372,9 +446,6 @@ def fetch_transactions_ripple_data() -> List[Dict]:
             for entry in data.get("transactions", []):
                 tx = entry.get("tx", {})
                 destination = tx.get("Destination", "")
-                if destination != address:
-                    continue  # ensure inflow into monitored address
-
                 amt = tx.get("Amount")
                 try:
                     # For XRP, Amount is in drops (string)
@@ -393,24 +464,40 @@ def fetch_transactions_ripple_data() -> List[Dict]:
                 canonical_ex = owner_from_address(address)
                 w = exchange_weight(canonical_ex)
 
-                flows.append(
-                    {
-                        "timestamp": timestamp,
-                        "xrp": xrp_amt,
-                        "exchange": canonical_ex,
-                        "to_address": address,
-                        "from_address": from_addr,
-                        "to_owner": canonical_ex,
-                        "from_owner": "",  # Ripple Data API does not provide owner strings
-                        "weight": w,
-                        "ripple_corp": ripple_corp,
-                    }
-                )
+                if destination == address:
+                    flows.append(
+                        {
+                            "timestamp": timestamp,
+                            "xrp": xrp_amt,
+                            "exchange": canonical_ex,
+                            "to_address": address,
+                            "from_address": from_addr,
+                            "to_owner": canonical_ex,
+                            "from_owner": "",  # Ripple Data API does not provide owner strings
+                            "weight": w,
+                            "ripple_corp": ripple_corp,
+                        }
+                    )
+
+                if MONITOR_OUTFLOWS and from_addr == address and destination:
+                    outflows.append(
+                        {
+                            "timestamp": timestamp,
+                            "xrp": xrp_amt,
+                            "exchange": canonical_ex,
+                            "to_address": destination,
+                            "from_address": from_addr,
+                            "to_owner": owner_from_address(destination),
+                            "from_owner": canonical_ex,
+                            "weight": w,
+                            "ripple_corp": False,
+                        }
+                    )
             time.sleep(RIPPLE_DATA_REQUEST_INTERVAL)
         except Exception as e:
             logging.error(f"Ripple Data fetch failed for {address}: {e}")
 
-    if not flows:
+    if not flows and (not outflows or not MONITOR_OUTFLOWS):
         logging.info("Ripple Data returned no flows; trying rippled RPC fallback")
         return fetch_transactions_rippled_rpc()
 
@@ -420,10 +507,16 @@ def fetch_transactions_ripple_data() -> List[Dict]:
         key = (f.get("from_address"), f.get("to_address"), f.get("timestamp"), f.get("xrp"))
         if key not in uniq:
             uniq[key] = f
-    return list(uniq.values())
+
+    uniq_out = {}
+    for f in outflows:
+        key = (f.get("from_address"), f.get("to_address"), f.get("timestamp"), f.get("xrp"))
+        if key not in uniq_out:
+            uniq_out[key] = f
+    return list(uniq.values()), list(uniq_out.values())
 
 
-def fetch_transactions(provider: Optional[str] = None) -> List[Dict]:
+def fetch_transactions(provider: Optional[str] = None) -> Tuple[List[Dict], List[Dict]]:
     resolved_provider = provider or resolve_provider()
 
     if resolved_provider == "ripple_data":
@@ -437,32 +530,30 @@ def fetch_transactions(provider: Optional[str] = None) -> List[Dict]:
             "Unknown XRPL inflow provider %s; defaulting to Whale Alert", resolved_provider
         )
 
-    txs = fetch_transactions_whale_alert()
-    if txs:
-        return txs
+    inflows, outflows = fetch_transactions_whale_alert()
+    if inflows or outflows:
+        return inflows, outflows
 
     logging.info("Whale Alert unavailable or empty; falling back to Ripple Data API")
     return fetch_transactions_ripple_data()
 
 
-def build_flows():
+def build_flows() -> Tuple[List[Dict], List[Dict]]:
     resolved_provider = resolve_provider()
 
     if resolved_provider == "ripple_data":
-        return prefer_cached_when_empty(fetch_transactions_ripple_data())
+        inflows, outflows = fetch_transactions_ripple_data()
+        return prefer_cached_when_empty(inflows), prefer_cached_outflows(outflows)
 
-    txs = fetch_transactions(resolved_provider)
+    txs, whale_outflows = fetch_transactions(resolved_provider)
     flows = []
+    outflows: List[Dict] = []
 
     for t in txs:
         if not isinstance(t, dict):
             continue
         to_obj = t.get("to") or {}
         from_obj = t.get("from") or {}
-
-        # Only care about inflows INTO exchanges
-        if to_obj.get("owner_type") != "exchange":
-            continue
 
         try:
             amt = float(t.get("amount", 0.0))
@@ -487,24 +578,41 @@ def build_flows():
 
         w = exchange_weight(canonical_ex)
 
-        flows.append(
-            {
-                "timestamp": ts,
-                "xrp": amt,
-                "exchange": canonical_ex,
-                "to_address": to_addr,
-                "from_address": from_addr,
-                "to_owner": to_owner,
-                "from_owner": from_owner,
-                "weight": w,
-                "ripple_corp": ripple_corp,
-            }
-        )
+        if to_obj.get("owner_type") == "exchange":
+            flows.append(
+                {
+                    "timestamp": ts,
+                    "xrp": amt,
+                    "exchange": canonical_ex,
+                    "to_address": to_addr,
+                    "from_address": from_addr,
+                    "to_owner": to_owner,
+                    "from_owner": from_owner,
+                    "weight": w,
+                    "ripple_corp": ripple_corp,
+                }
+            )
 
-    return prefer_cached_when_empty(flows)
+        if MONITOR_OUTFLOWS and from_obj.get("owner_type") == "exchange":
+            from_exchange = owner_from_address(from_addr) or from_owner or "Unknown"
+            outflows.append(
+                {
+                    "timestamp": ts,
+                    "xrp": amt,
+                    "exchange": from_exchange,
+                    "to_address": to_addr,
+                    "from_address": from_addr,
+                    "to_owner": to_owner,
+                    "from_owner": from_owner,
+                    "weight": exchange_weight(from_exchange),
+                    "ripple_corp": False,
+                }
+            )
+
+    return prefer_cached_when_empty(flows), prefer_cached_outflows(outflows or whale_outflows)
 
 
-def push(flows):
+def push(inflows: List[Dict], outflows: List[Dict]):
     try:
         rdb.set("xrpl:latest_inflows", json.dumps(flows))
         rdb.set(
@@ -522,6 +630,23 @@ def push(flows):
         )
         logging.info(f"XRPL inflows snapshot pushed: {len(flows)} txs")
         append_history(flows)
+
+        if MONITOR_OUTFLOWS:
+            rdb.set("xrpl:latest_outflows", json.dumps(outflows))
+            rdb.set(
+                "xrpl:latest_outflows_meta",
+                json.dumps(
+                    {
+                        "updated_at": datetime.now(timezone.utc)
+                        .isoformat()
+                        .replace("+00:00", "Z"),
+                        "provider": resolve_provider(),
+                        "count": len(outflows),
+                        "run_seconds": RUN,
+                    }
+                ),
+            )
+            append_outflow_history(outflows)
     except Exception as e:
         logging.error(f"XRPL inflows push failed: {e}")
 
@@ -550,9 +675,33 @@ def append_history(flows, max_len: int = 240):
         logging.error(f"XRPL inflow history write failed: {e}")
 
 
-def sample_flows() -> List[Dict]:
+def append_outflow_history(outflows: List[Dict], max_len: int = 240):
+    snapshot = {
+        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "total_xrp": float(sum(f.get("xrp", 0.0) for f in outflows)),
+        "weighted_xrp": float(sum(f.get("xrp", 0.0) * f.get("weight", 1.0) for f in outflows)),
+    }
+
+    try:
+        raw = rdb.get("xrpl:outflow_history")
+        history = json.loads(raw) if raw else []
+        if not isinstance(history, list):
+            history = []
+    except Exception:
+        history = []
+
+    history.append(snapshot)
+    history = history[-max_len:]
+
+    try:
+        rdb.set("xrpl:outflow_history", json.dumps(history))
+    except Exception as e:
+        logging.error(f"XRPL outflow history write failed: {e}")
+
+
+def sample_flows() -> Tuple[List[Dict], List[Dict]]:
     now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    return [
+    inflows = [
         {
             "timestamp": now,
             "xrp": 2_000_000,
@@ -579,12 +728,14 @@ def sample_flows() -> List[Dict]:
         },
     ]
 
+    return inflows, []
+
 
 def loop(use_sample: bool = False):
     while True:
         try:
-            flows = sample_flows() if use_sample else build_flows()
-            push(flows)
+            flows, outflows = sample_flows() if use_sample else build_flows()
+            push(flows, outflows)
         except Exception as e:
             logging.error(f"XRPL inflow loop error: {e}")
         time.sleep(RUN)
@@ -601,8 +752,8 @@ def main():
     args = parser.parse_args()
 
     if args.once:
-        flows = sample_flows() if args.sample else build_flows()
-        push(flows)
+        flows, outflows = sample_flows() if args.sample else build_flows()
+        push(flows, outflows)
     else:
         loop(use_sample=args.sample)
 

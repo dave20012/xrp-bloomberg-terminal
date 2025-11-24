@@ -96,6 +96,28 @@ def cache_get_json(key: str) -> Any:
     return None
 
 
+def empty_live_payload() -> Dict[str, Any]:
+    """Base structure for live metrics with safe defaults."""
+
+    return {
+        "price": None,
+        "funding_now_pct": 0.0,
+        "funding_hist_pct": [],
+        "oi_usd": None,
+        "long_short_ratio": 1.0,
+        "binance_netflow_24h": None,
+        "binance_notes": [],
+        "xrp_btc": None,
+        "xrp_eth": None,
+        "xrpl_raw_inflow": 0.0,
+        "xrpl_weighted_inflow": 0.0,
+        "xrpl_ripple_otc": 0.0,
+        "xrpl_raw_outflow": 0.0,
+        "xrpl_weighted_outflow": 0.0,
+        "xrpl_netflow": 0.0,
+    }
+
+
 def cached_coingecko_simple_price(
     ids: str, vs_currencies: str = "usd", fresh_ttl: int = 60, stale_ttl: int = 300
 ) -> Optional[Dict[str, Any]]:
@@ -419,20 +441,7 @@ def fetch_live():
     - Binance signed netflows (XRP) using API keys when provided
     - XRPL inflows (raw/weighted) and Ripple OTC flows from Redis
     """
-    result = {
-        "price": None,
-        "funding_now_pct": 0.0,
-        "funding_hist_pct": [],
-        "oi_usd": None,
-        "long_short_ratio": 1.0,
-        "binance_netflow_24h": None,
-        "binance_notes": [],
-        "xrp_btc": None,
-        "xrp_eth": None,
-        "xrpl_raw_inflow": 0.0,
-        "xrpl_weighted_inflow": 0.0,
-        "xrpl_ripple_otc": 0.0,
-    }
+    result = empty_live_payload()
 
     # Price with Redis fallback and throttled CoinGecko usage, then Binance/CryptoCompare
     price_resp = cached_coingecko_simple_price("ripple")
@@ -635,7 +644,7 @@ def fetch_live():
         else:
             result["binance_netflow_24h"] = 0.0
 
-    # XRPL inflows (from Redis, new v9.3 schema)
+    # XRPL inflows/outflows (from Redis, new v9.3 schema)
     try:
         raw = rdb.get("xrpl:latest_inflows")
         if raw:
@@ -647,29 +656,77 @@ def fetch_live():
     except Exception:
         inflows = []
 
+    try:
+        raw_out = rdb.get("xrpl:latest_outflows")
+        if raw_out:
+            if isinstance(raw_out, bytes):
+                raw_out = raw_out.decode("utf-8")
+            outflows = json.loads(raw_out)
+        else:
+            outflows = []
+    except Exception:
+        outflows = []
+
     raw_sum = 0.0
     weighted_sum = 0.0
     ripple_otc = 0.0
+    raw_out_sum = 0.0
+    weighted_out_sum = 0.0
 
-    for f in inflows:
-        try:
-            amt = float(f.get("xrp", 0.0))
-            w = float(f.get("weight", 1.0))
-            raw_sum += amt
-            weighted_sum += amt * w
-            if f.get("ripple_corp"):
-                ripple_otc += amt
-        except Exception:
-            continue
+    if inflows:
+        for f in inflows:
+            try:
+                amt = float(f.get("xrp", 0.0))
+                w = float(f.get("weight", 1.0))
+                raw_sum += amt
+                weighted_sum += amt * w
+                if f.get("ripple_corp"):
+                    ripple_otc += amt
+            except Exception:
+                continue
+    else:
+        history = cache_get_json("xrpl:inflow_history")
+        if isinstance(history, list) and history:
+            last = history[-1]
+            try:
+                raw_sum = float(last.get("total_xrp", 0.0))
+                weighted_sum = float(last.get("weighted_xrp", 0.0))
+            except Exception:
+                raw_sum = weighted_sum = 0.0
+
+    if outflows:
+        for f in outflows:
+            try:
+                amt = float(f.get("xrp", 0.0))
+                w = float(f.get("weight", 1.0))
+                raw_out_sum += amt
+                weighted_out_sum += amt * w
+            except Exception:
+                continue
+    else:
+        history_out = cache_get_json("xrpl:outflow_history")
+        if isinstance(history_out, list) and history_out:
+            last = history_out[-1]
+            try:
+                raw_out_sum = float(last.get("total_xrp", 0.0))
+                weighted_out_sum = float(last.get("weighted_xrp", 0.0))
+            except Exception:
+                raw_out_sum = weighted_out_sum = 0.0
 
     result["xrpl_raw_inflow"] = raw_sum
     result["xrpl_weighted_inflow"] = weighted_sum
     result["xrpl_ripple_otc"] = ripple_otc
+    result["xrpl_raw_outflow"] = raw_out_sum
+    result["xrpl_weighted_outflow"] = weighted_out_sum
+    result["xrpl_netflow"] = raw_sum - raw_out_sum
 
     return result
 
 
-live = fetch_live()
+if os.getenv("SKIP_LIVE_FETCH") == "1":
+    live = empty_live_payload()
+else:
+    live = fetch_live()
 
 # =========================
 # News sentiment from Redis + EMA
@@ -838,7 +895,7 @@ c5.metric("OI (USD)", f"${(live.get('oi_usd') or 0.0)/1e9:.2f}B")
 c6.metric("L/S Ratio", f"{live.get('long_short_ratio', 1.0):.2f}")
 
 st.markdown("### Sentiment & Flow")
-s1, s2, s3, s4, s5 = st.columns(5)
+s1, s2, s3, s4, s5, s6 = st.columns(6)
 label = (
     "Inst. Sentiment EMA" if sent_mode == "Institutional Only" else "News Sentiment EMA"
 )
@@ -849,7 +906,8 @@ s4.metric(
     "XRPL Inflows (raw, M XRP)",
     f"{(live.get('xrpl_raw_inflow') or 0.0)/1e6:+.1f}",
 )
-s5.metric(
+s5.metric("XRPL Outflows (raw, M XRP)", f"{(live.get('xrpl_raw_outflow') or 0.0)/1e6:+.1f}")
+s6.metric(
     "Ripple OTC → Exchanges (M XRP)",
     f"{(live.get('xrpl_ripple_otc') or 0.0)/1e6:+.1f}",
 )
@@ -858,6 +916,11 @@ st.metric(
     "XRPL Inflows (weighted, M XRP)",
     f"{(live.get('xrpl_weighted_inflow') or 0.0)/1e6:+.1f}",
 )
+st.metric(
+    "XRPL Outflows (weighted, M XRP)",
+    f"{(live.get('xrpl_weighted_outflow') or 0.0)/1e6:+.1f}",
+)
+st.metric("XRPL Netflow (M XRP)", f"{(live.get('xrpl_netflow') or 0.0)/1e6:+.1f}")
 
 st.metric("Flippening Flow Score", f"{flip_score:.2f}")
 st.write(
@@ -899,8 +962,12 @@ st.markdown("**Live Signal Breakdown (raw)**")
 raw_items = {
     "Funding Now (%)": live.get("funding_now_pct"),
     "Funding Z-Score": round(fund_z, 4),
-    "XRPL Net Inflow (raw, M XRP)": (live.get("xrpl_raw_inflow") or 0.0) / 1e6,
-    "XRPL Net Inflow (weighted, M XRP)": (live.get("xrpl_weighted_inflow") or 0.0)
+    "XRPL Inflows (raw, M XRP)": (live.get("xrpl_raw_inflow") or 0.0) / 1e6,
+    "XRPL Outflows (raw, M XRP)": (live.get("xrpl_raw_outflow") or 0.0) / 1e6,
+    "XRPL Netflow (raw, M XRP)": (live.get("xrpl_netflow") or 0.0) / 1e6,
+    "XRPL Inflows (weighted, M XRP)": (live.get("xrpl_weighted_inflow") or 0.0)
+    / 1e6,
+    "XRPL Outflows (weighted, M XRP)": (live.get("xrpl_weighted_outflow") or 0.0)
     / 1e6,
     "Ripple OTC → Exchanges (M XRP)": (live.get("xrpl_ripple_otc") or 0.0) / 1e6,
     "Binance Netflow 24h (XRP)": live.get("binance_netflow_24h"),
