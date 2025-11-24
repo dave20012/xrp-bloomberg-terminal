@@ -133,6 +133,44 @@ def write_ratio_ema(name: str, value: float):
     )
 
 
+def read_cached_binance_netflow():
+    obj = cache_get_json("cache:binance_netflow_24h")
+    if not isinstance(obj, dict):
+        return None, None
+    try:
+        val = float(obj.get("value", 0.0))
+    except Exception:
+        return None, obj.get("ts")
+    return val, obj.get("ts")
+
+
+def append_binance_netflow_history(value: float, ts: str, max_len: int = 120) -> None:
+    history = cache_get_json("cache:binance_netflow_hist")
+    if not isinstance(history, list):
+        history = []
+
+    entry_date = ts.split("T")[0]
+
+    # Skip if last entry already represents this date + value
+    if history:
+        last = history[-1]
+        if (
+            last.get("date") == entry_date
+            and abs(float(last.get("value", 0.0)) - float(value)) < 1e-9
+        ):
+            return
+
+    history.append({"date": entry_date, "value": float(value), "ts": ts})
+    history = history[-max_len:]
+    cache_set_json("cache:binance_netflow_hist", history)
+
+
+def write_cached_binance_netflow(value: float):
+    ts = datetime.utcnow().isoformat() + "Z"
+    cache_set_json("cache:binance_netflow_24h", {"value": float(value), "ts": ts})
+    append_binance_netflow_history(value, ts)
+
+
 # =========================
 # Live data fetch
 # =========================
@@ -154,7 +192,7 @@ def fetch_live():
         "funding_hist_pct": [],
         "oi_usd": None,
         "long_short_ratio": 1.0,
-        "binance_netflow_24h": 0.0,
+        "binance_netflow_24h": None,
         "xrp_btc": None,
         "xrp_eth": None,
         "xrpl_raw_inflow": 0.0,
@@ -279,9 +317,18 @@ def fetch_live():
                 if w.get("status") == 6
             )
             # positive = more withdrawals (coins leaving Binance)
-            result["binance_netflow_24h"] = wd_amt - dep_amt
+            netflow_val = wd_amt - dep_amt
+            result["binance_netflow_24h"] = netflow_val
+            write_cached_binance_netflow(netflow_val)
         except Exception:
             pass
+
+    if result["binance_netflow_24h"] is None:
+        cached_val, _ = read_cached_binance_netflow()
+        if cached_val is not None:
+            result["binance_netflow_24h"] = cached_val
+        else:
+            result["binance_netflow_24h"] = 0.0
 
     # XRPL inflows (from Redis, new v9.3 schema)
     try:
