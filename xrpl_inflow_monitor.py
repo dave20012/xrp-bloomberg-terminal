@@ -282,6 +282,19 @@ def build_flows():
 def push(flows):
     try:
         rdb.set("xrpl:latest_inflows", json.dumps(flows))
+        rdb.set(
+            "xrpl:latest_inflows_meta",
+            json.dumps(
+                {
+                    "updated_at": datetime.now(timezone.utc)
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                    "provider": resolve_provider(),
+                    "count": len(flows),
+                    "run_seconds": RUN,
+                }
+            ),
+        )
         logging.info(f"XRPL inflows snapshot pushed: {len(flows)} txs")
         append_history(flows)
     except Exception as e:

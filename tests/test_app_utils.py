@@ -1,6 +1,7 @@
 """Unit coverage for app_utils helper functions."""
 
 import unittest
+from datetime import datetime, timezone
 from unittest import mock
 
 import app_utils
@@ -69,6 +70,31 @@ class DataHealthTests(unittest.TestCase):
         self.assertTrue(any("news:sentiment_ema" in note for note in redis_notes))
         self.assertTrue(any("xrpl:inflow_history" in note for note in redis_notes))
         self.assertTrue(any("ratio_ema:xrp_btc" in note for note in redis_notes))
+
+    @mock.patch("app_utils.cache_get_json")
+    def test_describe_data_health_skips_fresh_xrpl_note(self, mock_cache):
+        def cache_side_effect(key):
+            if key == "xrpl:latest_inflows_meta":
+                return {
+                    "updated_at": datetime.now(timezone.utc)
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                    "run_seconds": 600,
+                }
+            if key == "xrpl:latest_inflows":
+                return []
+            if key == "xrpl:inflow_history":
+                return []
+            return None
+
+        mock_cache.side_effect = cache_side_effect
+
+        live = {"price": 0.5, "oi_usd": 1.0, "funding_hist_pct": [0.01], "xrpl_weighted_inflow": 0}
+        news_payload = {"count": 1}
+
+        _, redis_notes = app_utils.describe_data_health(live, news_payload)
+
+        self.assertFalse(any("xrpl:latest_inflows" in note for note in redis_notes))
 
 
 if __name__ == "__main__":

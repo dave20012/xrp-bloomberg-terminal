@@ -10,6 +10,7 @@ Streamlit dashboard with supporting workers that surface XRP price action, XRPL 
   - `news:sentiment` – latest sentiment payload written by the worker.
   - `news:sentiment_ema` – cached EMA used by the web app between refreshes.
   - `xrpl:latest_inflows` – most recent XRPL inflow slice.
+  - `xrpl:latest_inflows_meta` – heartbeat describing the last inflow poll (timestamp/provider).
   - `xrpl:inflow_history` – rolling inflow history for charts/analytics.
   - `cache:price:xrp_usd` – price fallback when APIs are unavailable.
   - `ratio_ema:xrp_btc`, `ratio_ema:xrp_eth` – cached EMA baselines for flippening ratios.
