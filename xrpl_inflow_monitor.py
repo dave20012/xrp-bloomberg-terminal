@@ -4,9 +4,9 @@
 # - ripple_corp (Ripple treasury -> exchange)
 # Pushes latest snapshot to Redis under "xrpl:latest_inflows"
 
-import os
 import json
 import logging
+import os
 import time
 from typing import Dict, List, Set
 
