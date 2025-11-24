@@ -114,8 +114,14 @@ def describe_data_health(live: Dict[str, Any], news_payload: Dict[str, Any]) -> 
     if cache_get_json("xrpl:latest_inflows") is None or not xrpl_fresh:
         redis_notes.append("Redis key `xrpl:latest_inflows` empty or stale.")
 
+    if cache_get_json("xrpl:latest_outflows") is None:
+        redis_notes.append("Redis key `xrpl:latest_outflows` empty; exchange withdrawal tracking unavailable.")
+
     if cache_get_json("xrpl:inflow_history") is None:
         redis_notes.append("Redis key `xrpl:inflow_history` missing; inflow history charts may be empty.")
+
+    if cache_get_json("xrpl:outflow_history") is None:
+        redis_notes.append("Redis key `xrpl:outflow_history` missing; outflow history charts may be empty.")
 
     if live.get("price") is None and cache_get_json("cache:price:xrp_usd"):
         redis_notes.append("Using cached price from `cache:price:xrp_usd`.")
