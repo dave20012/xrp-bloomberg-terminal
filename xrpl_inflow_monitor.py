@@ -9,7 +9,7 @@ import logging
 from datetime import datetime, timezone
 import os
 import time
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set
 
 import requests
 
@@ -22,10 +22,29 @@ WHALE_ALERT_API = "https://api.whale-alert.io/v1/transactions"
 RIPPLE_DATA_API = "https://data.ripple.com/v2/accounts/{address}/transactions"
 
 WHALE_ALERT_KEY = os.getenv("WHALE_ALERT_KEY")
-PROVIDER = os.getenv("XRPL_INFLOWS_PROVIDER", "whale_alert").lower()
+ENV_PROVIDER = os.getenv("XRPL_INFLOWS_PROVIDER", "whale_alert").lower()
+PROVIDER = ENV_PROVIDER
 RUN = int(os.getenv("XRPL_INFLOWS_INTERVAL", "600"))  # 10m default
 MIN_XRP = float(os.getenv("XRPL_MIN_XRP", "10000000"))
 LOOKBACK_SECONDS = int(os.getenv("XRPL_LOOKBACK_SECONDS", str(max(RUN * 2, 900))))
+
+_missing_key_info_logged = False
+
+
+def resolve_provider() -> str:
+    """Return the effective provider, respecting env and missing Whale Alert key."""
+
+    global _missing_key_info_logged
+
+    if PROVIDER == "whale_alert" and not WHALE_ALERT_KEY:
+        if not _missing_key_info_logged:
+            logging.info(
+                "WHALE_ALERT_KEY missing; defaulting XRPL inflow provider to ripple_data",
+            )
+            _missing_key_info_logged = True
+        return "ripple_data"
+
+    return PROVIDER
 
 
 def fetch_xrp_usd_price() -> float:
@@ -182,15 +201,32 @@ def fetch_transactions_ripple_data() -> List[Dict]:
     return list(uniq.values())
 
 
-def fetch_transactions() -> List[Dict]:
-    return fetch_transactions_whale_alert()
+def fetch_transactions(provider: Optional[str] = None) -> List[Dict]:
+    resolved_provider = provider or resolve_provider()
+
+    if resolved_provider == "ripple_data":
+        return fetch_transactions_ripple_data()
+
+    if resolved_provider != "whale_alert":
+        logging.warning(
+            "Unknown XRPL inflow provider %s; defaulting to Whale Alert", resolved_provider
+        )
+
+    txs = fetch_transactions_whale_alert()
+    if txs:
+        return txs
+
+    logging.info("Whale Alert unavailable or empty; falling back to Ripple Data API")
+    return fetch_transactions_ripple_data()
 
 
 def build_flows():
-    if PROVIDER == "ripple_data":
+    resolved_provider = resolve_provider()
+
+    if resolved_provider == "ripple_data":
         return fetch_transactions_ripple_data()
 
-    txs = fetch_transactions()
+    txs = fetch_transactions(resolved_provider)
     flows = []
 
     for t in txs:
