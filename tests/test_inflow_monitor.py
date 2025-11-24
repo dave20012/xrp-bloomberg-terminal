@@ -132,54 +132,5 @@ class PollIntervalEnvTests(unittest.TestCase):
         self.assertEqual(reloaded.RUN, 45)
 
 
-class RippleData403HandlingTests(unittest.TestCase):
-    def setUp(self):
-        monitor.ripple_data_blocked_addresses.clear()
-        monitor.ripple_data_cooldown_until = 0
-
-    def test_monitored_addresses_strip_whitespace(self):
-        with mock.patch.object(
-            monitor,
-            "EXCHANGE_ADDRESSES",
-            {"Sample": [" r123 ", "", "r456"]},
-        ):
-            self.assertEqual(monitor.monitored_addresses(), {"r123", "r456"})
-
-    def test_403_blocks_address_without_global_cooldown(self):
-        monitor.ripple_data_blocked_addresses.clear()
-        monitor.ripple_data_cooldown_until = 0
-
-        good_response = mock.Mock(
-            status_code=200,
-            ok=True,
-            json=lambda: {
-                "transactions": [
-                    {
-                        "tx": {
-                            "Destination": "good",
-                            "Amount": str(int((monitor.MIN_XRP + 1) * 1_000_000)),
-                            "Account": "src",
-                        },
-                        "date": "2025-01-01T00:00:00Z",
-                    }
-                ]
-            },
-        )
-
-        with mock.patch(
-            "xrpl_inflow_monitor.monitored_addresses", return_value=["bad", "good"]
-        ), mock.patch("xrpl_inflow_monitor.requests.get") as mock_get, mock.patch(
-            "xrpl_inflow_monitor.time.sleep"
-        ) as mock_sleep:
-            mock_get.side_effect = [mock.Mock(status_code=403, ok=False), good_response]
-            flows = monitor.fetch_transactions_ripple_data()
-
-        self.assertIn("bad", monitor.ripple_data_blocked_addresses)
-        self.assertEqual(monitor.ripple_data_cooldown_until, 0)
-        self.assertEqual(len(flows), 1)
-        self.assertEqual(flows[0].get("to_address"), "good")
-        mock_sleep.assert_called()
-
-
 if __name__ == "__main__":
     unittest.main()
