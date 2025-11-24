@@ -50,6 +50,27 @@ if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
 
 
+def normalize_env_value(name: str) -> str:
+    """Return a trimmed environment variable (blank string if missing)."""
+
+    return (os.getenv(name) or "").strip()
+
+
+def validate_binance_credentials(api_key: str, api_secret: str) -> Optional[str]:
+    """Detect common formatting mistakes that lead to Binance auth failures."""
+
+    templated_markers = ("${{", "}}", "BINANCE_API_KEY", "BINANCE_API_SECRET")
+    if any(marker in api_key for marker in templated_markers) or any(
+        marker in api_secret for marker in templated_markers
+    ):
+        return "Binance API credentials look templated; use the raw key/secret without ${{}} wrappers."
+
+    if any(ch.isspace() for ch in api_key) or any(ch.isspace() for ch in api_secret):
+        return "Binance API credentials contain whitespace; copy the raw strings from the Binance dashboard."
+
+    return None
+
+
 def cache_set_json(key: str, obj: Any) -> None:
     try:
         rdb.set(key, json.dumps(obj))
@@ -314,6 +335,7 @@ def fetch_live():
         "oi_usd": None,
         "long_short_ratio": 1.0,
         "binance_netflow_24h": None,
+        "binance_notes": [],
         "xrp_btc": None,
         "xrp_eth": None,
         "xrpl_raw_inflow": 0.0,
@@ -409,9 +431,13 @@ def fetch_live():
             pass
 
     # Binance signed netflow (XRP)
-    api_key = os.getenv("BINANCE_API_KEY")
-    api_secret = os.getenv("BINANCE_API_SECRET")
-    if api_key and api_secret and api_key.strip() and api_secret.strip():
+    api_key = normalize_env_value("BINANCE_API_KEY")
+    api_secret = normalize_env_value("BINANCE_API_SECRET")
+    binance_issue = None
+    if api_key and api_secret:
+        binance_issue = validate_binance_credentials(api_key, api_secret)
+
+    if api_key and api_secret and not binance_issue:
         try:
             base = "https://api.binance.com"
 
@@ -455,6 +481,9 @@ def fetch_live():
             write_cached_binance_netflow(netflow_val)
         except Exception:
             pass
+    elif binance_issue:
+        logger.warning(binance_issue)
+        result["binance_notes"].append(binance_issue)
 
     if result["binance_netflow_24h"] is None:
         cached_val, _ = read_cached_binance_netflow()
@@ -646,6 +675,8 @@ if issues:
     st.warning("Data issues: " + ", ".join(issues))
 if redis_notes:
     st.info("Redis/cache notes:\n- " + "\n- ".join(redis_notes))
+if live.get("binance_notes"):
+    st.info("Binance API notes:\n- " + "\n- ".join(live["binance_notes"]))
 
 # =========================
 # UI — Metrics
