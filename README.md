@@ -37,7 +37,7 @@ Streamlit dashboard with supporting workers that surface XRP price action, XRPL 
 
 ## Deployment (Railway)
 1. Push this repo to your Git provider and connect it to Railway (or push directly via Railway CLI).
-2. Add the Redis plugin in Railway (Dashboard → Plugins → Redis) and capture `REDIS_URL`.
+2. **Provision Redis as a separate service**: use the built-in Redis plugin (Dashboard → Plugins → Redis). Railway gives you `REDIS_URL` automatically—no custom Dockerfile is required. Avoid pointing this repo at a Redis service with a start command such as `docker-entrypoint.sh redis-server`; this image is Python-based and does not ship the Redis entrypoint, so the container will crash with `docker-entrypoint.sh: not found`. If you truly need a self-hosted Redis container, create a new Railway service that uses the official `redis:7-alpine` image and a simple start command like `redis-server --save 60 1 --dir $RAILWAY_VOLUME_MOUNT_PATH`.
 3. Configure environment variables (Project → Variables):
    - `REDIS_URL` (set automatically with the plugin)
    - `BINANCE_API_KEY`, `BINANCE_API_SECRET` (optional; netflow)
