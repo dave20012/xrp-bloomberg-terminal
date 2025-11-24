@@ -247,6 +247,47 @@ def compute_sentiment_components(articles: List[Dict[str, Any]], mode: str) -> T
     return float(inst), float(bull), float(bear)
 
 
+def _parse_inflow_timestamp(value: Any) -> Optional[datetime]:
+    """Return a timezone-aware datetime for inflow timestamps (epoch or ISO)."""
+
+    if value is None:
+        return None
+
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except Exception:  # noqa: BLE001
+            return None
+
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except Exception:  # noqa: BLE001
+            return None
+
+    return None
+
+
+def _infer_latest_inflow_ts(inflows: Any) -> Optional[datetime]:
+    """Return the newest timestamp from inflow entries (if available)."""
+
+    if not isinstance(inflows, list):
+        return None
+
+    parsed: List[datetime] = []
+    for entry in inflows:
+        if not isinstance(entry, dict):
+            continue
+        ts = _parse_inflow_timestamp(entry.get("timestamp"))
+        if ts:
+            parsed.append(ts)
+
+    if not parsed:
+        return None
+
+    return max(parsed)
+
+
 def describe_data_health(live: Dict[str, Any], news_payload: Dict[str, Any]) -> Tuple[List[str], List[str]]:
     """Return (issues, redis_notes) to surface data freshness and missing feeds."""
     issues: List[str] = []
@@ -267,20 +308,23 @@ def describe_data_health(live: Dict[str, Any], news_payload: Dict[str, Any]) -> 
             redis_notes.append("Redis key `news:sentiment_ema` missing (sentiment EMA fallback unavailable).")
 
     xrpl_meta = cache_get_json("xrpl:latest_inflows_meta")
-    xrpl_fresh = False
+    xrpl_inflows = cache_get_json("xrpl:latest_inflows")
+
+    xrpl_ts = None
+    xrpl_run_seconds = 600
     if isinstance(xrpl_meta, dict):
-        ts_raw = xrpl_meta.get("updated_at")
-        run_seconds = int(xrpl_meta.get("run_seconds") or 600)
-        try:
-            ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00")) if ts_raw else None
-        except Exception:  # noqa: BLE001
-            ts = None
+        xrpl_run_seconds = int(xrpl_meta.get("run_seconds") or xrpl_run_seconds)
+        xrpl_ts = _parse_inflow_timestamp(xrpl_meta.get("updated_at"))
 
-        if ts:
-            grace = max(run_seconds * 3, 900)  # tolerate temporary outages
-            xrpl_fresh = datetime.now(timezone.utc) - ts <= timedelta(seconds=grace)
+    if xrpl_ts is None:
+        xrpl_ts = _infer_latest_inflow_ts(xrpl_inflows)
 
-    if cache_get_json("xrpl:latest_inflows") is None or not xrpl_fresh:
+    xrpl_fresh = False
+    if xrpl_ts:
+        grace = max(xrpl_run_seconds * 3, 900)  # tolerate temporary outages
+        xrpl_fresh = datetime.now(timezone.utc) - xrpl_ts <= timedelta(seconds=grace)
+
+    if xrpl_inflows is None or not xrpl_fresh:
         redis_notes.append("Redis key `xrpl:latest_inflows` empty or stale.")
 
     if cache_get_json("xrpl:inflow_history") is None:
