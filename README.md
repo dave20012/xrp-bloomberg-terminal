@@ -51,7 +51,7 @@ Streamlit dashboard with supporting workers that surface XRP price action, XRPL 
    - `XRPL_RPC_ENDPOINTS` (comma-separated rippled JSON-RPC URLs; defaults to public s1/s2 endpoints)
    - `HF_TOKEN` (optional; FinBERT inference)
    - `META_REFRESH_SECONDS` (optional, default 45)
-   - `XRPL_POLL_SECONDS` (optional, default 30)
+   - `XRPL_POLL_SECONDS` (optional, default 30; `XRPL_INFLOWS_INTERVAL` still supported for backwards compatibility)
    - `SENTIMENT_RUN_INTERVAL` (optional override, default 1800 seconds)
 4. Railway will detect the Procfile and run:
    - `web`: Streamlit app
