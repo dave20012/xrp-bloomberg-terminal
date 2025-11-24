@@ -21,6 +21,14 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 WHALE_ALERT_API = "https://api.whale-alert.io/v1/transactions"
 RIPPLE_DATA_API = "https://data.ripple.com/v2/accounts/{address}/transactions"
 RIPPLE_DATA_HEADERS = {"User-Agent": "xrpl-inflow-monitor/1.0", "Accept": "application/json"}
+RIPPLE_RPC_ENDPOINTS = [
+    e.strip()
+    for e in os.getenv(
+        "XRPL_RPC_ENDPOINTS",
+        "https://s2.ripple.com:51234/,https://s1.ripple.com:51234/",
+    ).split(",")
+    if e.strip()
+]
 
 RIPPLE_DATA_COOLDOWN_SECONDS = int(os.getenv("RIPPLE_DATA_COOLDOWN_SECONDS", "900"))
 RIPPLE_DATA_MAX_COOLDOWN_SECONDS = int(os.getenv("RIPPLE_DATA_MAX_COOLDOWN_SECONDS", "3600"))
@@ -36,6 +44,7 @@ LOOKBACK_SECONDS = int(os.getenv("XRPL_LOOKBACK_SECONDS", str(max(RUN * 2, 900))
 _missing_key_info_logged = False
 ripple_data_cooldown_until = 0.0
 ripple_data_failure_streak = 0
+_rpc_endpoint_index = 0
 
 
 def resolve_provider() -> str:
@@ -135,6 +144,30 @@ def monitored_addresses() -> Set[str]:
     return addrs
 
 
+def rotate_rpc_endpoint() -> str:
+    """Return the next XRPL public RPC endpoint in a round-robin fashion."""
+
+    global _rpc_endpoint_index
+
+    if not RIPPLE_RPC_ENDPOINTS:
+        return ""
+
+    endpoint = RIPPLE_RPC_ENDPOINTS[_rpc_endpoint_index % len(RIPPLE_RPC_ENDPOINTS)]
+    _rpc_endpoint_index += 1
+    return endpoint
+
+
+def ripple_epoch_to_unix(ripple_seconds: Optional[int]) -> int:
+    """Convert Ripple epoch seconds to unix epoch seconds."""
+
+    if ripple_seconds is None:
+        return 0
+    try:
+        return int(ripple_seconds) + 946684800  # Ripple epoch starts 2000-01-01
+    except Exception:
+        return 0
+
+
 def fetch_cached_flows() -> List[Dict]:
     """Return the last successful inflow snapshot from Redis (if available)."""
 
@@ -151,6 +184,110 @@ def fetch_cached_flows() -> List[Dict]:
         pass
 
     return []
+
+
+def fetch_transactions_rippled_rpc() -> List[Dict]:
+    """Fetch inflows using public rippled JSON-RPC servers as a fallback provider."""
+
+    flows: List[Dict] = []
+    start = time.time() - LOOKBACK_SECONDS
+
+    for address in monitored_addresses():
+        endpoint = rotate_rpc_endpoint()
+        if not endpoint:
+            logging.warning("No XRPL RPC endpoints configured")
+            break
+
+        try:
+            resp = requests.post(
+                endpoint,
+                json={
+                    "method": "account_tx",
+                    "params": [
+                        {
+                            "account": address,
+                            "ledger_index_min": -1,
+                            "ledger_index_max": -1,
+                            "limit": 200,
+                            "forward": False,
+                        }
+                    ],
+                },
+                timeout=20,
+                headers={"User-Agent": "xrpl-inflow-monitor/1.0"},
+            )
+
+            if not resp.ok:
+                logging.warning(
+                    "rippled RPC error %s for %s via %s", resp.status_code, address, endpoint
+                )
+                time.sleep(RIPPLE_DATA_REQUEST_INTERVAL)
+                continue
+
+            data = resp.json() or {}
+            result = data.get("result") or {}
+            transactions = result.get("transactions") or []
+
+            for entry in transactions:
+                tx = entry.get("tx") or {}
+
+                if tx.get("TransactionType") != "Payment":
+                    continue
+
+                destination = tx.get("Destination", "")
+                if destination != address:
+                    continue
+
+                amt = tx.get("Amount")
+                if not isinstance(amt, (int, float, str)):
+                    continue  # Ignore non-XRP payments
+
+                try:
+                    xrp_amt = float(amt) / 1_000_000
+                except Exception:
+                    continue
+
+                if xrp_amt < MIN_XRP:
+                    continue
+
+                ripple_ts = tx.get("date") or entry.get("tx_json", {}).get("date")
+                ts = ripple_epoch_to_unix(ripple_ts)
+
+                if ts and ts < start:
+                    continue
+
+                from_addr = tx.get("Account", "")
+                lower_from = from_addr.lower() if from_addr else ""
+                ripple_corp = from_addr in RIPPLE_CORP_ADDRESSES or lower_from.startswith(
+                    "ripple"
+                )
+                canonical_ex = owner_from_address(address)
+                w = exchange_weight(canonical_ex)
+
+                flows.append(
+                    {
+                        "timestamp": ts,
+                        "xrp": xrp_amt,
+                        "exchange": canonical_ex,
+                        "to_address": address,
+                        "from_address": from_addr,
+                        "to_owner": canonical_ex,
+                        "from_owner": "",  # rippled RPC does not resolve owners
+                        "weight": w,
+                        "ripple_corp": ripple_corp,
+                    }
+                )
+            time.sleep(RIPPLE_DATA_REQUEST_INTERVAL)
+        except Exception as e:
+            logging.error("rippled RPC fetch failed for %s via %s: %s", address, endpoint, e)
+            time.sleep(RIPPLE_DATA_REQUEST_INTERVAL)
+
+    uniq = {}
+    for f in flows:
+        key = (f.get("from_address"), f.get("to_address"), f.get("timestamp"), f.get("xrp"))
+        if key not in uniq:
+            uniq[key] = f
+    return list(uniq.values())
 
 
 def prefer_cached_when_empty(flows: List[Dict]) -> List[Dict]:
@@ -185,7 +322,12 @@ def fetch_transactions_ripple_data() -> List[Dict]:
             .isoformat()
             .replace("+00:00", "Z"),
         )
-        return fetch_cached_flows()
+        cached = fetch_cached_flows()
+        if cached:
+            return cached
+
+        logging.info("Cached XRPL inflows unavailable; falling back to rippled RPC during Ripple Data cooldown")
+        return fetch_transactions_rippled_rpc()
 
     for address in monitored_addresses():
         try:
@@ -217,7 +359,8 @@ def fetch_transactions_ripple_data() -> List[Dict]:
                 if cached:
                     logging.info("Serving cached XRPL inflows during Ripple Data cooldown")
                     return cached
-                break
+                logging.info("No cached inflows; attempting rippled RPC fallback after Ripple Data 403")
+                return fetch_transactions_rippled_rpc()
             if not resp.ok:
                 logging.warning(f"Ripple Data API error {resp.status_code} for {address}")
                 time.sleep(RIPPLE_DATA_REQUEST_INTERVAL)
@@ -266,6 +409,10 @@ def fetch_transactions_ripple_data() -> List[Dict]:
         except Exception as e:
             logging.error(f"Ripple Data fetch failed for {address}: {e}")
 
+    if not flows:
+        logging.info("Ripple Data returned no flows; trying rippled RPC fallback")
+        return fetch_transactions_rippled_rpc()
+
     # De-duplicate by transaction hash + destination to avoid duplicates across pages
     uniq = {}
     for f in flows:
@@ -280,6 +427,9 @@ def fetch_transactions(provider: Optional[str] = None) -> List[Dict]:
 
     if resolved_provider == "ripple_data":
         return fetch_transactions_ripple_data()
+
+    if resolved_provider == "rippled":
+        return fetch_transactions_rippled_rpc()
 
     if resolved_provider != "whale_alert":
         logging.warning(
