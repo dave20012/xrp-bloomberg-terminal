@@ -66,6 +66,9 @@ class DataHealthTests(unittest.TestCase):
         self.assertIn("XRP price feed unavailable (CoinGecko)", issues)
         self.assertTrue(any("news:sentiment" in note for note in redis_notes))
         self.assertTrue(any("xrpl:latest_inflows" in note for note in redis_notes))
+        self.assertTrue(any("news:sentiment_ema" in note for note in redis_notes))
+        self.assertTrue(any("xrpl:inflow_history" in note for note in redis_notes))
+        self.assertTrue(any("ratio_ema:xrp_btc" in note for note in redis_notes))
 
 
 if __name__ == "__main__":
