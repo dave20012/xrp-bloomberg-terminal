@@ -45,6 +45,8 @@ NEWS_KEY = os.getenv("NEWS_API_KEY")
 HF_TOKEN = os.getenv("HF_TOKEN")
 RUN_INTERVAL = int(os.getenv("SENTIMENT_RUN_INTERVAL", "1800"))  # 30m default
 SENTIMENT_EMA_ALPHA = float(os.getenv("SENTIMENT_EMA_ALPHA", "0.3"))
+HF_TIMEOUT = int(os.getenv("HF_TIMEOUT", "18"))
+HF_FAIL_FAST = int(os.getenv("HF_FAIL_FAST", "4"))  # max consecutive FinBERT misses before skipping remaining titles
 
 # ===================== Source Weight Map =========================
 
@@ -148,44 +150,52 @@ def finbert(text: str):
     if not HF_TOKEN:
         return None
 
-    url = "https://router.huggingface.co/hf-inference/models/ProsusAI/finbert"
+    endpoints = [
+        "https://router.huggingface.co/hf-inference/models/ProsusAI/finbert",
+        "https://api-inference.huggingface.co/models/ProsusAI/finbert",  # fallback to main HF inference API
+    ]
+
     headers = {"Authorization": f"Bearer {HF_TOKEN}"}
     payload = {"inputs": text}
 
-    for _ in range(2):  # one retry
-        try:
-            r = requests.post(url, headers=headers, json=payload, timeout=30)
-            if not r.ok:
-                logging.warning(f"FinBERT error {r.status_code}: {r.text[:120]}")
-                time.sleep(0.5)
-                continue
+    for attempt in range(2):  # one retry per endpoint rotation
+        for url in endpoints:
+            try:
+                r = requests.post(url, headers=headers, json=payload, timeout=HF_TIMEOUT)
+                if not r.ok:
+                    logging.warning(f"FinBERT error {r.status_code} ({url}): {r.text[:120]}")
+                    time.sleep(0.5)
+                    continue
 
-            resp = r.json()
+                resp = r.json()
 
-            # Possible shapes:
-            # 1) [ {label, score}, ... ]
-            # 2) [ [ {label, score}, ... ] ]
-            if isinstance(resp, list) and resp:
-                if isinstance(resp[0], dict):
-                    preds = resp
-                elif isinstance(resp[0], list) and resp[0]:
-                    preds = resp[0]
+                # Possible shapes:
+                # 1) [ {label, score}, ... ]
+                # 2) [ [ {label, score}, ... ] ]
+                if isinstance(resp, list) and resp:
+                    if isinstance(resp[0], dict):
+                        preds = resp
+                    elif isinstance(resp[0], list) and resp[0]:
+                        preds = resp[0]
+                    else:
+                        logging.warning(f"Unexpected FinBERT shape: {type(resp[0])}")
+                        return None
                 else:
-                    logging.warning(f"Unexpected FinBERT shape: {type(resp[0])}")
+                    logging.warning("Empty or non-list FinBERT response")
                     return None
-            else:
-                logging.warning("Empty or non-list FinBERT response")
-                return None
 
-            scores = {x["label"].lower(): float(x["score"]) for x in preds if "label" in x}
-            pos = scores.get("positive", 0.0)
-            neg = scores.get("negative", 0.0)
-            neu = scores.get("neutral", 0.0)
-            return pos, neg, neu
+                scores = {x["label"].lower(): float(x["score"]) for x in preds if "label" in x}
+                pos = scores.get("positive", 0.0)
+                neg = scores.get("negative", 0.0)
+                neu = scores.get("neutral", 0.0)
+                return pos, neg, neu
 
-        except Exception as e:
-            logging.error(f"FinBERT inference failed: {e}")
-            time.sleep(0.5)
+            except requests.Timeout:
+                logging.error(f"FinBERT inference timed out ({url}, {HF_TIMEOUT}s)")
+                time.sleep(0.5)
+            except Exception as e:
+                logging.error(f"FinBERT inference failed ({url}): {e}")
+                time.sleep(0.5)
 
     return None
 
@@ -267,6 +277,8 @@ def run_once():
     scalar_scores = []
     weights = []
 
+    consecutive_failures = 0
+
     for a in filtered[:24]:  # cap per run
         w = source_weight(a["source"])
         res = finbert(a["title"])
@@ -286,6 +298,7 @@ def run_once():
             )
             scalar_scores.append(scalar)
             weights.append(w)
+            consecutive_failures = 0
         else:
             scored.append(
                 {
@@ -297,6 +310,13 @@ def run_once():
                     "weight": w,
                 }
             )
+            consecutive_failures += 1
+
+        if consecutive_failures >= HF_FAIL_FAST:
+            logging.error(
+                f"Skipping remaining headlines after {consecutive_failures} consecutive FinBERT failures"
+            )
+            break
 
         time.sleep(0.22)
 
