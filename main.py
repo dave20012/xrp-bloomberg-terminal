@@ -6,7 +6,7 @@ import os
 import hmac
 import hashlib
 import time
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode
 
 import json
@@ -395,7 +395,7 @@ def read_sentiment_ema():
 def write_sentiment_ema(value: float):
     cache_set_json(
         "news:sentiment_ema",
-        {"ema": float(value), "timestamp": datetime.utcnow().isoformat() + "Z"},
+        {"ema": float(value), "timestamp": datetime.now(timezone.utc).isoformat()},
     )
 
 

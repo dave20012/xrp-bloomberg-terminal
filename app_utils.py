@@ -31,9 +31,14 @@ def cache_get_json(key: str) -> Any:
     return None
 
 
-def safe_get(url: str, params: Optional[Dict[str, Any]] = None, timeout: int = 10) -> Any:
+def safe_get(
+    url: str,
+    params: Optional[Dict[str, Any]] = None,
+    timeout: int = 10,
+    headers: Optional[Dict[str, str]] = None,
+) -> Any:
     try:
-        resp = requests.get(url, params=params, timeout=timeout)
+        resp = requests.get(url, params=params, timeout=timeout, headers=headers)
         if not resp.ok:
             logger.warning("GET %s failed with status %s", url, resp.status_code)
             return None
