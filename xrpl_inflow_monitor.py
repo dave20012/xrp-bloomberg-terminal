@@ -152,6 +152,20 @@ def fetch_cached_flows() -> List[Dict]:
     return []
 
 
+def prefer_cached_when_empty(flows: List[Dict]) -> List[Dict]:
+    """Return cached inflows when a polling run produced no data."""
+
+    if flows:
+        return flows
+
+    cached = fetch_cached_flows()
+    if cached:
+        logging.info("Using cached XRPL inflows because fresh poll returned no data")
+        return cached
+
+    return []
+
+
 def fetch_transactions_ripple_data() -> List[Dict]:
     """Fetch inflows to curated exchange addresses using Ripple Data (free)."""
 
@@ -283,7 +297,7 @@ def build_flows():
     resolved_provider = resolve_provider()
 
     if resolved_provider == "ripple_data":
-        return fetch_transactions_ripple_data()
+        return prefer_cached_when_empty(fetch_transactions_ripple_data())
 
     txs = fetch_transactions(resolved_provider)
     flows = []
@@ -335,7 +349,7 @@ def build_flows():
             }
         )
 
-    return flows
+    return prefer_cached_when_empty(flows)
 
 
 def push(flows):
