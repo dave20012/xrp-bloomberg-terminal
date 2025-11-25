@@ -72,10 +72,18 @@ TIER_2 = [
 TIER_3 = ["coindesk", "cointelegraph", "cryptoslate", "bitcoinist", "cryptobriefing"]
 TABLOID = ["biztoc", "zycrypto", "u.today", "dailyhodl", "ambcrypto"]
 
+# Headlines that often carry bullish implications despite neutral/negative language
+POSITIVE_KEYWORD_BIASES = {
+    "supply shock": 0.35,
+    "supply squeeze": 0.25,
+    "supply crunch": 0.25,
+}
+
 
 def source_weight(src: str) -> float:
     if not src:
         return 0.25
+
     s = src.lower()
     if any(x in s for x in TIER_1):
         return 1.00
@@ -86,6 +94,28 @@ def source_weight(src: str) -> float:
     if any(x in s for x in TABLOID):
         return 0.05
     return 0.15
+
+
+def apply_keyword_bias(title: str, scalar: float) -> float:
+    """Adjust the FinBERT scalar using simple keyword heuristics.
+
+    Some market narratives (e.g., an upcoming supply shock) are bullish even if
+    FinBERT scores them slightly negative due to words like "shock". This bias
+    nudges such headlines in the appropriate direction while keeping the output
+    bounded to [-1, 1].
+    """
+
+    if not title:
+        return float(scalar)
+
+    bias = 0.0
+    lower = title.lower()
+    for kw, boost in POSITIVE_KEYWORD_BIASES.items():
+        if kw in lower:
+            bias += boost
+
+    adjusted = scalar + bias
+    return float(max(-1.0, min(1.0, adjusted)))
 
 
 # ====================== Headline Filter ==========================
@@ -364,7 +394,7 @@ def run_once(use_sample: bool = False):
 
         if res is not None:
             pos, neg, neu = res
-            scalar = pos - neg
+            scalar = apply_keyword_bias(a["title"], pos - neg)
             scored.append(
                 {
                     **a,
