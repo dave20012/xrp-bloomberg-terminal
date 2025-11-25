@@ -1420,22 +1420,8 @@ with flow_chart_col:
     if not flow_hist_df.empty:
         flow_hist_df["timestamp"] = pd.to_datetime(flow_hist_df.get("timestamp"))
         flow_hist_df = flow_hist_df.sort_values("timestamp")
-        flow_hist_df["exchange_xrp"] = (
-            flow_hist_df.get(
-                "exchange_xrp",
-                pd.Series(0.0, index=flow_hist_df.index, dtype="float64"),
-            )
-            .fillna(0.0)
-            / 1e6
-        )
-        flow_hist_df["ripple_corp_xrp"] = (
-            flow_hist_df.get(
-                "ripple_corp_xrp",
-                pd.Series(0.0, index=flow_hist_df.index, dtype="float64"),
-            )
-            .fillna(0.0)
-            / 1e6
-        )
+        flow_hist_df["exchange_xrp"] = flow_hist_df.get("exchange_xrp", 0.0).fillna(0.0) / 1e6
+        flow_hist_df["ripple_corp_xrp"] = flow_hist_df.get("ripple_corp_xrp", 0.0).fillna(0.0) / 1e6
 
         fig_flow = go.Figure()
         fig_flow.add_bar(
