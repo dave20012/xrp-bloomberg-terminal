@@ -2,6 +2,8 @@
 
 import math
 import os
+import importlib.util
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -440,16 +442,53 @@ def fetch_xrpl_flows() -> Dict[str, Any]:
     inflow_meta = cache_get_json("xrpl:latest_inflows_meta") or {}
     history = cache_get_json("xrpl:inflow_history")
 
+    def _fallback_inflows_when_missing() -> Tuple[List[Dict], List[Dict], Optional[str]]:
+        """Attempt a live fetch when Redis lacks XRPL inflow snapshots.
+
+        Prefers Whale Alert data when a key is configured; otherwise falls back to
+        Ripple Data for a free, unauthenticated snapshot.
+        """
+
+        if os.getenv("SKIP_LIVE_FETCH") or os.getenv("PYTEST_CURRENT_TEST"):
+            return [], [], None
+
+        if importlib.util.find_spec("xrpl_inflow_monitor") is None:
+            return [], [], None
+
+        import xrpl_inflow_monitor  # type: ignore
+
+        provider = xrpl_inflow_monitor.resolve_provider()
+        live_inflows, live_outflows = xrpl_inflow_monitor.fetch_transactions(provider)
+
+        if live_inflows or live_outflows:
+            return live_inflows, live_outflows, provider
+
+        # If Whale Alert is empty or unavailable, try Ripple Data as a free fallback.
+        ripple_inflows, ripple_outflows = xrpl_inflow_monitor.fetch_transactions("ripple_data")
+        return ripple_inflows, ripple_outflows, "ripple_data"
+
     def _total_amount(flows: Any) -> float:
         if not isinstance(flows, list):
             return 0.0
         total = 0.0
         for entry in flows:
             try:
-                total += float(entry.get("amount", 0.0))
+                total += float(entry.get("xrp") or entry.get("amount") or 0.0)
             except Exception:  # noqa: BLE001
                 continue
         return total
+
+    if not inflows:
+        inflows, outflows, provider = _fallback_inflows_when_missing()
+        if inflows:
+            inflow_meta = inflow_meta or {}
+            inflow_meta.setdefault(
+                "updated_at",
+                datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            )
+            inflow_meta.setdefault("provider", provider or "unknown")
+            inflow_meta.setdefault("count", len(inflows))
+            inflow_meta.setdefault("run_seconds", 0)
 
     return {
         "latest_inflow": _total_amount(inflows),
