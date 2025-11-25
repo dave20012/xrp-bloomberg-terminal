@@ -3,6 +3,7 @@ import unittest
 
 from redis_client import rdb
 from sentiment_worker import (
+    apply_keyword_bias,
     dedupe_headlines,
     normalize_titles,
     read_cached_headlines,
@@ -106,6 +107,11 @@ class SentimentHeadlineTests(unittest.TestCase):
 
         self.assertEqual(payload["count"], 4)
         self.assertTrue(all(article.get("scalar") is not None for article in payload["articles"]))
+
+    def test_keyword_bias_flips_supply_shock_positive(self):
+        title = "Here’s Why A Supply Shock Could Be Imminent For XRP"
+        biased = apply_keyword_bias(title, -0.2)
+        self.assertGreater(biased, 0.0)
 
 
 if __name__ == "__main__":
