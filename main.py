@@ -54,12 +54,19 @@ def redact_secret(value: str, keep: int = 4) -> str:
     return f"{value[:keep]}***{value[-keep:]}"
 
 
-def load_binance_credentials() -> Tuple[str, str]:
-    """Centralized Binance credential loader for sidebar and data fetches."""
+def validate_binance_credentials(api_key: str, api_secret: str) -> Optional[str]:
+    """Detect common formatting mistakes that lead to Binance auth failures."""
 
-    api_key = normalize_env_value("BINANCE_API_KEY")
-    api_secret = normalize_env_value("BINANCE_API_SECRET")
-    return api_key, api_secret
+    templated_markers = ("${{", "}}", "BINANCE_API_KEY", "BINANCE_API_SECRET")
+    if any(marker in api_key for marker in templated_markers) or any(
+        marker in api_secret for marker in templated_markers
+    ):
+        return "Binance API credentials look templated; use the raw key/secret without ${{}} wrappers."
+
+    if any(ch.isspace() for ch in api_key) or any(ch.isspace() for ch in api_secret):
+        return "Binance API credentials contain whitespace; copy the raw strings from the Binance dashboard."
+
+    return None
 
 
 st.set_page_config(page_title="XRP Engine v9.3", layout="wide", initial_sidebar_state="collapsed")
@@ -97,7 +104,8 @@ with st.sidebar:
         st.experimental_rerun()
 
     st.subheader("Config & Credentials")
-    api_key, api_secret = load_binance_credentials()
+    api_key = normalize_env_value("BINANCE_API_KEY")
+    api_secret = normalize_env_value("BINANCE_API_SECRET")
     st.caption("Binance keys are read from environment variables; secrets are redacted for safety.")
     st.code(
         f"BINANCE_API_KEY={redact_secret(api_key)}\nBINANCE_API_SECRET={redact_secret(api_secret)}",
