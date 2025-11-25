@@ -19,6 +19,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from app_utils import resolve_sentiment_conflicts
 from redis_client import rdb
 from signals import (
     SIGNAL_COMPONENTS,
@@ -1570,8 +1571,13 @@ with st.expander("Sentiment Drill-down", expanded=False):
             except Exception:
                 bucket_label = "Latest sentiment window"
 
-        top_pos = sorted(filtered_articles, key=lambda a: a.get("scalar", 0.0), reverse=True)[:3]
-        top_neg = sorted(filtered_articles, key=lambda a: a.get("scalar", 0.0))[:3]
+        pos_candidates = sorted(filtered_articles, key=lambda a: a.get("scalar", 0.0), reverse=True)
+        neg_candidates = sorted(filtered_articles, key=lambda a: a.get("scalar", 0.0))
+
+        resolved_pos, resolved_neg = resolve_sentiment_conflicts(pos_candidates, neg_candidates)
+
+        top_pos = resolved_pos[:3]
+        top_neg = resolved_neg[:3]
 
         cpos, cneg = st.columns(2)
         with cpos:
