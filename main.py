@@ -19,7 +19,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from app_utils import normalize_env_value, resolve_sentiment_conflicts, safe_get
+from app_utils import resolve_sentiment_conflicts, safe_get
 from redis_client import rdb
 from signals import (
     SIGNAL_COMPONENTS,
@@ -31,6 +31,18 @@ from targets import build_target_profile, compute_atr
 # =========================
 # Config / constants
 # =========================
+def normalize_env_value(name: str) -> str:
+    """Return a trimmed environment variable (blank string if missing)."""
+
+    raw = (os.getenv(name) or "").strip()
+
+    # Railway variables sometimes get pasted with surrounding quotes.
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {'"', "'"}:
+        raw = raw[1:-1].strip()
+
+    return raw
+
+
 def redact_secret(value: str, keep: int = 4) -> str:
     """Return a partially redacted secret for safe display."""
 
