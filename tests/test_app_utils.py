@@ -38,6 +38,31 @@ class SafeGetTests(unittest.TestCase):
         self.assertIsNone(data)
         mock_get.assert_called_once()
 
+    @mock.patch("app_utils.requests.get")
+    def test_safe_get_handles_rate_limit(self, mock_get):
+        resp = mock.Mock()
+        resp.ok = False
+        resp.status_code = 429
+        mock_get.return_value = resp
+
+        data = app_utils.safe_get("https://example.com/throttle")
+
+        self.assertIsNone(data)
+        mock_get.assert_called_once()
+
+    @mock.patch("app_utils.requests.get")
+    def test_safe_get_handles_bad_json(self, mock_get):
+        resp = mock.Mock()
+        resp.ok = True
+        resp.status_code = 200
+        resp.json.side_effect = ValueError("no json")
+        mock_get.return_value = resp
+
+        data = app_utils.safe_get("https://example.com/not-json")
+
+        self.assertIsNone(data)
+        mock_get.assert_called_once()
+
 
 class SentimentComponentTests(unittest.TestCase):
     def test_compute_sentiment_components_filters_weights(self):
