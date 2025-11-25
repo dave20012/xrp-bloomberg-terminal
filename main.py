@@ -1,5 +1,6 @@
 """BlackRock-style XRP macro surveillance dashboard."""
 
+import math
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -10,6 +11,7 @@ import streamlit as st
 
 from app_utils import cache_get_json, normalize_env_value, safe_get
 from redis_client import rdb
+from signals import SIGNAL_COMPONENTS, calibrated_conviction_probability, log_score_components
 
 # =========================
 # Page config & styling
@@ -109,6 +111,199 @@ def styled_metric(title: str, value: str, note: str = "") -> None:
         """,
         unsafe_allow_html=True,
     )
+
+
+def _clamp(value: float, *, lo: float = 0.0, hi: float = 1.0) -> float:
+    return max(lo, min(hi, value))
+
+
+def compute_signal_stack(
+    price: Dict[str, Optional[float]],
+    futures: Dict[str, Optional[float]],
+    flows: Dict[str, Any],
+    sentiment: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Translate raw telemetry into composite-ready signal contributions."""
+
+    details: List[Dict[str, Any]] = []
+
+    def add_component(
+        key: str,
+        *,
+        points: float,
+        available: bool,
+        status: str,
+        note: str,
+    ) -> None:
+        meta = SIGNAL_COMPONENTS.get(key)
+        max_points = meta.max_points if meta else 0.0
+        details.append(
+            {
+                "key": key,
+                "name": meta.name if meta else key,
+                "points": max(0.0, min(points, max_points)),
+                "max_points": max_points,
+                "status": status,
+                "note": note,
+                "available": available,
+                "cap_note": meta.cap_note if meta else "",
+            }
+        )
+
+    price_usd = price.get("price")
+    price_meta = SIGNAL_COMPONENTS.get("price_window")
+    if price_usd is None:
+        add_component(
+            "price_window",
+            points=0.0,
+            available=False,
+            status="Waiting on price feed",
+            note="CoinGecko price missing; composite gated until price returns.",
+        )
+    else:
+        if price_usd <= 2.45:
+            price_points = price_meta.max_points
+            status = "In breakout zone"
+        elif price_usd >= 3.0:
+            price_points = 0.0
+            status = "Extended; patience warranted"
+        else:
+            scale = _clamp((3.0 - price_usd) / (3.0 - 2.45))
+            price_points = price_meta.max_points * scale
+            status = "Approaching extension"
+        add_component(
+            "price_window",
+            points=price_points,
+            available=True,
+            status=status,
+            note=f"${price_usd:,.4f} vs. $2.45–$3.00 window",
+        )
+
+    funding = futures.get("funding")
+    fund_meta = SIGNAL_COMPONENTS.get("funding")
+    if funding is None:
+        add_component(
+            "funding",
+            points=0.0,
+            available=False,
+            status="Funding unavailable",
+            note="Binance funding endpoint did not return data.",
+        )
+    else:
+        funding_bps = funding * 10_000
+        scaled = math.tanh(max(funding_bps, 0.0) / 10.0)
+        funding_points = fund_meta.max_points * scaled
+        status = "Bullish carry" if funding_bps > 0.5 else "Flat/neutral"
+        add_component(
+            "funding",
+            points=funding_points,
+            available=True,
+            status=status,
+            note=f"{funding_bps:+.2f} bps drift (tanh-capped)",
+        )
+
+    oi_usd = futures.get("open_interest")
+    oi_meta = SIGNAL_COMPONENTS.get("oi")
+    if oi_usd is None:
+        add_component(
+            "oi",
+            points=0.0,
+            available=False,
+            status="OI missing",
+            note="Open interest endpoint unavailable.",
+        )
+    else:
+        depth_scale = _clamp((oi_usd - 1_500_000_000) / (2_700_000_000 - 1_500_000_000))
+        oi_points = depth_scale * oi_meta.max_points
+        status = "Depth supportive" if depth_scale >= 0.6 else "Shallow liquidity"
+        add_component(
+            "oi",
+            points=oi_points,
+            available=True,
+            status=status,
+            note=f"${oi_usd:,.0f} open interest vs. $1.5B–$2.7B lane",
+        )
+
+    inflow = flows.get("latest_inflow")
+    flow_meta = SIGNAL_COMPONENTS.get("whale_flow")
+    if inflow is None:
+        add_component(
+            "whale_flow",
+            points=0.0,
+            available=False,
+            status="XRPL inflow missing",
+            note="Redis cache empty; worker may be offline.",
+        )
+    else:
+        flow_scale = _clamp(float(inflow) / 60_000_000)
+        flow_points = flow_scale * flow_meta.max_points
+        status = "Exchange demand building" if inflow > 10_000_000 else "Muted demand"
+        add_component(
+            "whale_flow",
+            points=flow_points,
+            available=True,
+            status=status,
+            note=f"{float(inflow):,.0f} XRP tagged inflow (capped at 60M)",
+        )
+
+    outflow = flows.get("latest_outflow")
+    netflow_meta = SIGNAL_COMPONENTS.get("netflow")
+    if inflow is None or outflow is None:
+        add_component(
+            "netflow",
+            points=0.0,
+            available=False,
+            status="Netflow unknown",
+            note="Need both inflow and outflow slices to score withdrawals.",
+        )
+    else:
+        withdrawals = max(outflow - inflow, 0.0)
+        netflow_scale = _clamp(withdrawals / 100_000_000)
+        netflow_points = netflow_scale * netflow_meta.max_points
+        status = "Exchanges net-withdrawing" if withdrawals > 0 else "Flat/accumulating"
+        add_component(
+            "netflow",
+            points=netflow_points,
+            available=True,
+            status=status,
+            note=f"{withdrawals:,.0f} XRP 24h net withdrawal bias",
+        )
+
+    sentiment_ema = sentiment.get("ema")
+    sent_meta = SIGNAL_COMPONENTS.get("sentiment")
+    if sentiment_ema is None:
+        add_component(
+            "sentiment",
+            points=0.0,
+            available=False,
+            status="Sentiment cache missing",
+            note="Sentiment worker has not populated EMA.",
+        )
+    else:
+        sentiment_scale = _clamp((sentiment_ema - 0.05) / (0.30 - 0.05))
+        sentiment_points = sent_meta.max_points * sentiment_scale
+        status = "Headline tone supportive" if sentiment_ema >= 0.15 else "Muted tone"
+        add_component(
+            "sentiment",
+            points=sentiment_points,
+            available=True,
+            status=status,
+            note=f"EMA {sentiment_ema:+.2f} vs. +0.05/+0.30 lane",
+        )
+
+    total_points = sum(d["points"] for d in details if d["available"])
+    total_cap = sum(d["max_points"] for d in details if d["available"])
+    normalized = (total_points / total_cap * 100.0) if total_cap else 0.0
+    normalized = min(100.0, max(0.0, normalized))
+
+    log_score_components({d["key"]: d["points"] for d in details})
+
+    return {
+        "details": details,
+        "composite": normalized,
+        "probability": calibrated_conviction_probability(normalized),
+        "coverage": total_cap,
+    }
 
 
 # =========================
@@ -358,6 +553,51 @@ def render_market_header(price: Dict[str, Optional[float]], flows: Dict[str, Any
         styled_metric("Flow heartbeat", source.title(), f"{time_ago(ts)} via {source}")
 
 
+def render_signal_panel(stack: Dict[str, Any]) -> None:
+    st.markdown("### Signals & Conviction")
+
+    composite = stack.get("composite", 0.0)
+    conviction_pct = stack.get("probability", 0.0) * 100.0
+
+    col_a, col_b = st.columns([1.4, 1])
+    with col_a:
+        styled_metric(
+            "Composite Score",
+            f"{composite:.1f} / 100",
+            f"Bullish conviction {conviction_pct:.1f}% (coverage weighted)",
+        )
+        st.progress(composite / 100.0)
+
+    missing = [d for d in stack.get("details", []) if not d.get("available")]
+    if missing:
+        with col_b:
+            st.info(
+                "Signals rescaled to available inputs; missing feeds: "
+                + ", ".join(d.get("name", d.get("key", "")) for d in missing)
+            )
+
+    for detail in stack.get("details", []):
+        max_points = detail.get("max_points") or 1.0
+        fill = max(0.0, min(1.0, (detail.get("points", 0.0) / max_points)))
+        badge_cls = "tag-ok" if detail.get("available") else "tag-warn"
+        st.markdown(
+            f"""
+            <div class="metric" style="margin-top:10px;">
+                <h3>{detail.get("name")}</h3>
+                <div class="value">{detail.get("points", 0.0):.1f} / {max_points:.1f} pts</div>
+                <div class="note">
+                    <span class="tag {badge_cls}" style="margin-right:6px;">{detail.get("status")}</span>
+                    {detail.get("note", "")}
+                </div>
+                <div style="height:8px; background:{PALETTE['panel']}; border-radius:999px; overflow:hidden; margin-top:10px;">
+                    <div style="width:{fill*100:.0f}%; height:100%; background:{PALETTE['accent']};"></div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
 def render_price_panel(history: Optional[List[Tuple[datetime, float]]]) -> None:
     st.markdown("### Market Structure")
     if not history:
@@ -529,12 +769,15 @@ price_history = fetch_price_history()
 futures = fetch_funding_and_oi()
 flows = fetch_xrpl_flows()
 sentiment = fetch_sentiment()
+signal_stack = compute_signal_stack(price_snapshot, futures, flows, sentiment)
 
 render_market_header(price_snapshot, flows)
 st.divider()
 
 col_left, col_right = st.columns([1.4, 1])
 with col_left:
+    render_signal_panel(signal_stack)
+    st.divider()
     render_price_panel(price_history)
     st.divider()
     render_liquidity_panel(futures, flows)
