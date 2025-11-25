@@ -409,6 +409,12 @@ def fetch_funding_and_oi() -> Dict[str, Optional[float]]:
     funding: Optional[float] = None
     oi: Optional[float] = None
 
+    def _to_float(value: Any) -> Optional[float]:
+        try:
+            return float(value)
+        except Exception:  # noqa: BLE001
+            return None
+
     try:
         resp = requests.get(
             f"{BINANCE_FAPI}/futures/data/fundingRate",
@@ -417,9 +423,22 @@ def fetch_funding_and_oi() -> Dict[str, Optional[float]]:
         )
         if resp.ok and resp.json():
             funding_raw = resp.json()[0]
-            funding = float(funding_raw.get("fundingRate", 0.0))
+            funding = _to_float(funding_raw.get("fundingRate"))
     except Exception:  # noqa: BLE001
         funding = None
+
+    if funding is None:
+        try:
+            resp = requests.get(
+                f"{BINANCE_FAPI}/fapi/v1/premiumIndex",
+                params={"symbol": "XRPUSDT"},
+                timeout=REQUEST_TIMEOUT,
+            )
+            if resp.ok:
+                payload = resp.json() or {}
+                funding = _to_float(payload.get("lastFundingRate"))
+        except Exception:  # noqa: BLE001
+            funding = None
 
     try:
         resp = requests.get(
@@ -429,9 +448,22 @@ def fetch_funding_and_oi() -> Dict[str, Optional[float]]:
         )
         if resp.ok and resp.json():
             oi_raw = resp.json()[0]
-            oi = float(oi_raw.get("sumOpenInterest", 0.0))
+            oi = _to_float(oi_raw.get("sumOpenInterest"))
     except Exception:  # noqa: BLE001
         oi = None
+
+    if oi is None:
+        try:
+            resp = requests.get(
+                f"{BINANCE_FAPI}/fapi/v1/openInterest",
+                params={"symbol": "XRPUSDT"},
+                timeout=REQUEST_TIMEOUT,
+            )
+            if resp.ok:
+                payload = resp.json() or {}
+                oi = _to_float(payload.get("openInterest"))
+        except Exception:  # noqa: BLE001
+            oi = None
 
     return {"funding": funding, "open_interest": oi}
 
