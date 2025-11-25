@@ -40,10 +40,17 @@ def safe_get(
 ) -> Any:
     try:
         resp = requests.get(url, params=params, timeout=timeout, headers=headers)
+        if resp.status_code == 429:
+            logger.warning("GET %s throttled with 429; falling back to cache when possible", url)
+            return None
         if not resp.ok:
             logger.warning("GET %s failed with status %s", url, resp.status_code)
             return None
-        return resp.json()
+        try:
+            return resp.json()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("GET %s returned non-JSON payload: %s", url, exc)
+            return None
     except Exception as exc:  # noqa: BLE001
         logger.warning("GET %s raised exception: %s", url, exc)
         return None

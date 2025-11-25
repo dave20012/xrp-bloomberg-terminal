@@ -19,7 +19,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from app_utils import resolve_sentiment_conflicts
+from app_utils import resolve_sentiment_conflicts, safe_get
 from redis_client import rdb
 from signals import (
     SIGNAL_COMPONENTS,
@@ -257,26 +257,6 @@ def cached_crypto_compare_price(symbol: str = "XRP", currency: str = "USD", ttl:
             return None
 
     return None
-
-
-def safe_get(
-    url: str,
-    params: Optional[Dict[str, Any]] = None,
-    timeout: int = 10,
-    headers: Optional[Dict[str, str]] = None,
-) -> Any:
-    try:
-        resp = requests.get(url, params=params, timeout=timeout, headers=headers)
-        if resp.status_code == 429:
-            logger.warning("GET %s throttled with 429; falling back to cache when possible", url)
-            return None
-        if not resp.ok:
-            logger.warning("GET %s failed with status %s", url, resp.status_code)
-            return None
-        return resp.json()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("GET %s raised exception: %s", url, exc)
-        return None
 
 
 def cache_with_expiry(key: str, value: Any, ttl_seconds: int) -> None:
@@ -970,6 +950,10 @@ def fetch_live():
     binance_issue = None
     if api_key and api_secret:
         binance_issue = validate_binance_credentials(api_key, api_secret)
+    else:
+        result["binance_notes"].append(
+            "Binance netflow requires BINANCE_API_KEY and BINANCE_API_SECRET; showing cached data when available."
+        )
 
     if api_key and api_secret and not binance_issue:
         try:
@@ -1020,11 +1004,15 @@ def fetch_live():
         result["binance_notes"].append(binance_issue)
 
     if result["binance_netflow_24h"] is None:
-        cached_val, _ = read_cached_binance_netflow()
+        cached_val, cached_ts = read_cached_binance_netflow()
         if cached_val is not None:
             result["binance_netflow_24h"] = cached_val
-        else:
-            result["binance_netflow_24h"] = 0.0
+            if cached_ts:
+                result["binance_notes"].append(
+                    f"Using cached Binance netflow from {cached_ts}."
+                )
+        elif binance_issue:
+            result["binance_notes"].append("Binance netflow unavailable; see warning above.")
 
     # XRPL inflows (from Redis, new v9.3 schema)
     try:
@@ -1342,7 +1330,11 @@ with o2:
     metric_card("XRP/ETH", f"{eth_ratio:.8f}" if eth_ratio else "—", "vs EMA uplift {eth_uplift_pct:+.2f}%")
 with o3:
     metric_card("L/S Ratio", f"{live.get('long_short_ratio', 1.0):.2f}", "Short-squeeze setup")
-    metric_card("Binance Netflow (24h)", f"{(live.get('binance_netflow_24h') or 0.0)/1e6:+.1f}M XRP")
+    netflow_live = live.get("binance_netflow_24h")
+    metric_card(
+        "Binance Netflow (24h)",
+        f"{netflow_live/1e6:+.1f}M XRP" if netflow_live is not None else "N/A",
+    )
     metric_card(
         "Spot Volume (24h)",
         f"${volume_latest/1e6:,.1f}M" if volume_latest else "—",
