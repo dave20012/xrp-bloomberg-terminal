@@ -20,6 +20,11 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from redis_client import rdb
+from signals import (
+    SIGNAL_COMPONENTS,
+    calibrated_conviction_probability,
+    log_score_components,
+)
 
 # =========================
 # Config / constants
@@ -353,6 +358,252 @@ def _linear_window_score(value: Optional[float], start: float, end: float, max_s
     ratio = (val - lower) / (upper - lower)
     score = max_score * (1.0 - ratio if start < end else ratio)
     return float(max(0.0, min(max_score, score)))
+
+
+def compute_atr(df: pd.DataFrame, period: int = 14) -> Optional[float]:
+    """Return the latest Average True Range from OHLC data."""
+
+    if df is None or df.empty or not {"high", "low", "close"}.issubset(df.columns):
+        return None
+
+    df_sorted = df.sort_values("date")
+    high = df_sorted["high"].astype(float)
+    low = df_sorted["low"].astype(float)
+    close = df_sorted["close"].astype(float)
+    prev_close = close.shift(1)
+
+    tr = pd.DataFrame(
+        {
+            "hl": high - low,
+            "hc": (high - prev_close).abs(),
+            "lc": (low - prev_close).abs(),
+        }
+    ).max(axis=1)
+
+    atr = tr.rolling(period).mean().iloc[-1]
+    return float(atr) if not pd.isna(atr) else None
+
+
+def risk_bands(price: Optional[float], atr: Optional[float]) -> Dict[str, Any]:
+    """Return ATR-based entry/TP/stop bands and a risk classification."""
+
+    if price is None or atr is None or price <= 0 or atr <= 0:
+        return {
+            "band": "N/A",
+            "atr_pct": None,
+            "entry": None,
+            "tp": None,
+            "stop": None,
+            "text": "ATR unavailable; waiting for sufficient OHLC candles.",
+        }
+
+    atr_pct = atr / price * 100.0
+    if atr_pct >= 12:
+        band = "High Volatility"
+    elif atr_pct >= 7:
+        band = "Elevated"
+    else:
+        band = "Contained"
+
+    tp = price + atr * 1.5
+    stop = max(price - atr, 0)
+
+    return {
+        "band": band,
+        "atr_pct": atr_pct,
+        "entry": price,
+        "tp": tp,
+        "stop": stop,
+        "text": f"ATR {atr_pct:.1f}% of price — {band} regime",
+    }
+
+
+def append_metric_history(name: str, value: Optional[float], max_age_days: int = 7, max_len: int = 480) -> None:
+    """Persist metric history to Redis for delta calculations."""
+
+    if value is None:
+        return
+
+    now = time.time()
+    key = f"history:metric:{name}"
+    hist = cache_get_json(key) or []
+    if not isinstance(hist, list):
+        hist = []
+
+    fresh = []
+    for item in hist:
+        try:
+            ts = float(item.get("ts", 0.0))
+            if now - ts <= max_age_days * 86400:
+                fresh.append({"ts": ts, "value": float(item.get("value", 0.0))})
+        except Exception:
+            continue
+
+    fresh.append({"ts": now, "value": float(value)})
+    cache_set_json(key, fresh[-max_len:])
+
+
+def metric_delta(name: str, horizon_hours: int) -> Optional[float]:
+    """Return percentage change over ``horizon_hours`` when enough history exists."""
+
+    key = f"history:metric:{name}"
+    hist = cache_get_json(key) or []
+    if not isinstance(hist, list) or len(hist) < 2:
+        return None
+
+    now = time.time()
+    relevant = [item for item in hist if now - float(item.get("ts", 0.0)) <= horizon_hours * 3600]
+    if len(relevant) < 2:
+        return None
+
+    start = float(relevant[0].get("value", 0.0))
+    end = float(relevant[-1].get("value", 0.0))
+    if abs(start) <= 1e-9:
+        return None
+    return (end - start) / abs(start) * 100.0
+
+
+def build_proxy_composite_series(
+    df: pd.DataFrame,
+    funding_hist: List[float],
+    sentiment_ema: float,
+    inflow_history: Optional[List[Dict[str, Any]]],
+    netflow_hist: Optional[List[Dict[str, Any]]],
+) -> Optional[pd.Series]:
+    """Generate a proxy composite curve to gate backtests using available history.
+
+    We blend volume percentile, short-term price momentum, funding z-scores,
+    weighted inflows, and cached Binance netflow history when available.
+    """
+
+    if df is None or df.empty:
+        return None
+
+    base = df.sort_values("date").copy()
+    vol_pct = base["volume"].rank(pct=True).fillna(0.0)
+    momentum = (base["close"] / base["close"].rolling(5).mean() - 1.0).fillna(0.0)
+    momentum_score = np.tanh(momentum * 8)  # emphasize fast ramps
+
+    funding_series = pd.Series(funding_hist[-len(base) :] if funding_hist else []).reindex(
+        base.index, method="pad", fill_value=0.0
+    )
+    if funding_series.std() <= 1e-8:
+        funding_z = pd.Series(0.0, index=base.index)
+    else:
+        funding_z = (funding_series - funding_series.mean()) / funding_series.std()
+    funding_score = np.tanh(funding_z)  # -1..1
+
+    inflow_series: pd.Series
+    if inflow_history:
+        inflow_df = pd.DataFrame(inflow_history).tail(len(base))
+        inflow_series = inflow_df.get("weighted_xrp", pd.Series(dtype=float)).astype(float)
+        inflow_series = inflow_series.reindex(range(len(base)), method="pad", fill_value=0.0)
+    else:
+        inflow_series = pd.Series(0.0, index=base.index)
+
+    inflow_norm = np.tanh((inflow_series - inflow_series.mean()) / (inflow_series.std() + 1e-6))
+
+    netflow_series: pd.Series
+    if netflow_hist:
+        netflow_df = pd.DataFrame(netflow_hist).tail(len(base))
+        netflow_series = netflow_df.get("value", pd.Series(dtype=float)).astype(float)
+        netflow_series = netflow_series.reindex(range(len(base)), method="pad", fill_value=0.0)
+    else:
+        netflow_series = pd.Series(0.0, index=base.index)
+
+    netflow_score = np.tanh(netflow_series / (abs(netflow_series).max() + 1e-6))
+
+    sentiment_boost = float(np.tanh(sentiment_ema * 2.5)) if sentiment_ema else 0.0
+
+    composite = (
+        vol_pct * 35
+        + (momentum_score + 1) * 15  # shift to 0..2 range, then scale
+        + (funding_score + 1) * 15
+        + (inflow_norm + 1) * 15
+        + (netflow_score + 1) * 10
+        + sentiment_boost * 10
+    )
+
+    return composite.clip(lower=0.0, upper=100.0)
+
+
+def xrpl_flow_breakdown() -> Dict[str, Any]:
+    """Return latest XRPL flow decomposition plus 7d z-scores."""
+
+    inflows = cache_get_json("xrpl:latest_inflows") or []
+    inflow_history = cache_get_json("xrpl:inflow_history") or []
+
+    exchange_raw = sum(float(f.get("xrp", 0.0)) for f in inflows if not f.get("ripple_corp"))
+    otc_raw = sum(float(f.get("xrp", 0.0)) for f in inflows if f.get("ripple_corp"))
+
+    def zscore_from_history(field: str) -> float:
+        if not isinstance(inflow_history, list) or len(inflow_history) < 3:
+            return 0.0
+        series = pd.Series([float(x.get(field, 0.0) or 0.0) for x in inflow_history[-42:]])
+        if series.std() <= 1e-6:
+            return 0.0
+        return float((series.iloc[-1] - series.mean()) / series.std())
+
+    return {
+        "exchange_raw": exchange_raw,
+        "otc_raw": otc_raw,
+        "total_z": zscore_from_history("weighted_xrp"),
+        "exchange_z": zscore_from_history("exchange_xrp"),
+        "otc_z": zscore_from_history("ripple_corp_xrp"),
+        "history": inflow_history,
+    }
+
+
+def detect_regimes(
+    price_change_24h: Optional[float],
+    funding_z: float,
+    btc_dev: float,
+    eth_dev: float,
+    oi_delta_24h: Optional[float],
+    volume_pct: float,
+    ls_ratio: Optional[float],
+) -> List[Tuple[str, str, str]]:
+    """Return labeled regime badges (label, description, severity)."""
+
+    regimes: List[Tuple[str, str, str]] = []
+
+    if price_change_24h is not None and price_change_24h < -2.0 and funding_z > 0.8:
+        regimes.append(
+            (
+                "Funding/Price Divergence",
+                "Price down while funding positive — watch for mean reversion or squeezes",
+                "warn",
+            )
+        )
+
+    if abs(btc_dev) >= 2.0 or abs(eth_dev) >= 2.0:
+        regimes.append(
+            (
+                "Ratio Detachment",
+                f"XRP/BTC {btc_dev:+.1f}% / XRP/ETH {eth_dev:+.1f}% away from EMAs",
+                "warn" if max(abs(btc_dev), abs(eth_dev)) < 5 else "alert",
+            )
+        )
+
+    if oi_delta_24h is not None and oi_delta_24h <= -5.0:
+        regimes.append(
+            (
+                "Liquidity Drain",
+                f"Open interest off {oi_delta_24h:.1f}% in 24h — lighter liquidity",
+                "alert",
+            )
+        )
+
+    if volume_pct >= 80 and ls_ratio is not None and ls_ratio < 0.95:
+        regimes.append(
+            (
+                "Short Squeeze Watch",
+                "Heavy volume with short skew could force covering on upside breaks",
+                "ok",
+            )
+        )
+
+    return regimes
 
 
 def derive_price_window(
@@ -880,6 +1131,10 @@ if os.getenv("SKIP_LIVE_FETCH") == "1":
 else:
     live = fetch_live()
 
+append_metric_history("oi_usd", live.get("oi_usd"))
+append_metric_history("funding_now_pct", live.get("funding_now_pct"))
+append_metric_history("binance_netflow_24h", live.get("binance_netflow_24h"))
+
 # =========================
 # News sentiment from Redis + EMA
 # =========================
@@ -1013,40 +1268,95 @@ fund_z = (fund_now - np.mean(fund_hist)) / (
     np.std(fund_hist) if np.std(fund_hist) > 1e-8 else 1e-8
 )
 
-funding_score = _capped_positive_score(fund_z, scale=22.0, cap=22.0)
+funding_score = _capped_positive_score(
+    fund_z, scale=SIGNAL_COMPONENTS["funding"].max_points, cap=SIGNAL_COMPONENTS["funding"].max_points
+)
 
 whale_flow_score = min(
-    14.0, max(0.0, (live.get("xrpl_weighted_inflow") or 0.0) / 60e6 * 14.0)
+    SIGNAL_COMPONENTS["whale_flow"].max_points,
+    max(0.0, (live.get("xrpl_weighted_inflow") or 0.0) / 60e6 * SIGNAL_COMPONENTS["whale_flow"].max_points),
 )
 
 price_score = _linear_window_score(
-    live.get("price"), start=price_window_start, end=price_window_end, max_score=28.0
+    live.get("price"),
+    start=price_window_start,
+    end=price_window_end,
+    max_score=SIGNAL_COMPONENTS["price_window"].max_points,
 )
 
 oi_score = _linear_window_score(
-    (live.get("oi_usd") or 0.0) / 1e9, start=2.7, end=1.5, max_score=16.0
+    (live.get("oi_usd") or 0.0) / 1e9,
+    start=2.7,
+    end=1.5,
+    max_score=SIGNAL_COMPONENTS["oi"].max_points,
 )
 
 netflow_score = min(
-    30.0, max(0.0, (live.get("binance_netflow_24h") or 0.0) / 100e6 * 30.0)
+    SIGNAL_COMPONENTS["netflow"].max_points,
+    max(
+        0.0,
+        (-(live.get("binance_netflow_24h") or 0.0))
+        / 15e6
+        * SIGNAL_COMPONENTS["netflow"].max_points,
+    ),
 )
 
 ls_ratio = live.get("long_short_ratio", 1.0) or 0.0
-short_squeeze_score = min(20.0, max(0.0, (2.0 - ls_ratio) * 20.0))
+short_squeeze_score = min(
+    SIGNAL_COMPONENTS["squeeze"].max_points, max(0.0, (2.0 - ls_ratio) * SIGNAL_COMPONENTS["squeeze"].max_points)
+)
 
-sentiment_score = _linear_window_score(ema_sent, start=0.3, end=0.05, max_score=15.0)
+sentiment_score = _linear_window_score(
+    ema_sent, start=0.3, end=0.05, max_score=SIGNAL_COMPONENTS["sentiment"].max_points
+)
 
 points = {
-    "Funding Z-Score": funding_score,
-    "Whale Flow (XRPL, weighted)": whale_flow_score,
-    f"Price window ${price_window_start:.2f}–${price_window_end:.2f}": price_score,
-    "OI > $2.7B": oi_score,
-    "Binance Netflow Bullish": netflow_score,
-    "Short Squeeze Setup": short_squeeze_score,
-    "Positive News (EMA)": sentiment_score,
-    "Flippening Flow": flip_score,
+    SIGNAL_COMPONENTS["funding"].name: funding_score,
+    SIGNAL_COMPONENTS["whale_flow"].name: whale_flow_score,
+    SIGNAL_COMPONENTS["price_window"].name: price_score,
+    SIGNAL_COMPONENTS["oi"].name: oi_score,
+    SIGNAL_COMPONENTS["netflow"].name: netflow_score,
+    SIGNAL_COMPONENTS["squeeze"].name: short_squeeze_score,
+    SIGNAL_COMPONENTS["sentiment"].name: sentiment_score,
+    SIGNAL_COMPONENTS["flippening"].name: flip_score,
 }
 total_score = float(min(100.0, sum(points.values())))
+log_score_components(points)
+
+atr_val = compute_atr(chart_df)
+last_price = live.get("price") or (float(chart_df["close"].iloc[-1]) if not chart_df.empty else None)
+risk_profile = risk_bands(last_price, atr_val)
+
+conviction_prob = calibrated_conviction_probability(total_score)
+conviction_prob *= 1.0 + max(0.0, ema_sent) * 0.2 + max(0.0, weighted_inflow_m) / 200.0
+conviction_prob = float(min(0.98, max(0.02, conviction_prob)))
+
+oi_delta_24h = metric_delta("oi_usd", 24)
+netflow_delta_24h = metric_delta("binance_netflow_24h", 24)
+funding_delta_7d = metric_delta("funding_now_pct", 24 * 7)
+
+price_change_24h = None
+if not chart_df.empty and len(chart_df) >= 2:
+    last_close = float(chart_df["close"].iloc[-1])
+    prev_close = float(chart_df["close"].iloc[-2])
+    if prev_close:
+        price_change_24h = (last_close / prev_close - 1.0) * 100.0
+
+flow_breakdown = xrpl_flow_breakdown()
+netflow_hist = cache_get_json("history:metric:binance_netflow_24h")
+
+proxy_composite = build_proxy_composite_series(
+    chart_df, fund_hist, ema_sent, flow_breakdown.get("history"), netflow_hist
+)
+regimes = detect_regimes(
+    price_change_24h,
+    fund_z,
+    btc_uplift_pct,
+    eth_uplift_pct,
+    oi_delta_24h,
+    volume_percentile,
+    live.get("long_short_ratio"),
+)
 
 # =========================
 # Data health banner
@@ -1087,10 +1397,89 @@ with f1:
     metric_card(label, f"{ema_sent:+.3f}", sub=f"Bull {bull_intensity:+.3f} • Bear {bear_intensity:+.3f}")
     metric_card("Ripple OTC → Exchanges", f"{(live.get('xrpl_ripple_otc') or 0.0)/1e6:+.1f}M XRP")
 with f2:
-    metric_card("XRPL Inflows", f"{(live.get('xrpl_raw_inflow') or 0.0)/1e6:+.1f}M raw", sub=f"Weighted {(live.get('xrpl_weighted_inflow') or 0.0)/1e6:+.1f}M")
-    metric_card("XRPL Outflows", f"{(live.get('xrpl_raw_outflow') or 0.0)/1e6:+.1f}M raw", sub=f"Weighted {(live.get('xrpl_weighted_outflow') or 0.0)/1e6:+.1f}M")
+    metric_card(
+        "XRPL Inflows",
+        f"{(live.get('xrpl_raw_inflow') or 0.0)/1e6:+.1f}M raw",
+        sub=f"Weighted {(live.get('xrpl_weighted_inflow') or 0.0)/1e6:+.1f}M",
+    )
+    metric_card(
+        "XRPL Outflows",
+        f"{(live.get('xrpl_raw_outflow') or 0.0)/1e6:+.1f}M raw",
+        sub=f"Weighted {(live.get('xrpl_weighted_outflow') or 0.0)/1e6:+.1f}M",
+    )
 with f3:
-    metric_card("XRPL Netflow", f"{(live.get('xrpl_netflow') or 0.0)/1e6:+.1f}M XRP", sub=f"Flippening score {flip_score:.2f}")
+    metric_card(
+        "XRPL Netflow",
+        f"{(live.get('xrpl_netflow') or 0.0)/1e6:+.1f}M XRP",
+        sub=f"Flippening score {flip_score:.2f}",
+    )
+
+flow_chart_col, flow_meta_col = st.columns([1.8, 1])
+with flow_chart_col:
+    flow_hist_df = pd.DataFrame(flow_breakdown.get("history", [])).tail(21)
+    if not flow_hist_df.empty:
+        flow_hist_df["timestamp"] = pd.to_datetime(flow_hist_df.get("timestamp"))
+        flow_hist_df = flow_hist_df.sort_values("timestamp")
+        flow_hist_df["exchange_xrp"] = (
+            flow_hist_df.get(
+                "exchange_xrp",
+                pd.Series(0.0, index=flow_hist_df.index, dtype="float64"),
+            )
+            .fillna(0.0)
+            / 1e6
+        )
+        flow_hist_df["ripple_corp_xrp"] = (
+            flow_hist_df.get(
+                "ripple_corp_xrp",
+                pd.Series(0.0, index=flow_hist_df.index, dtype="float64"),
+            )
+            .fillna(0.0)
+            / 1e6
+        )
+
+        fig_flow = go.Figure()
+        fig_flow.add_bar(
+            x=flow_hist_df["timestamp"],
+            y=flow_hist_df["exchange_xrp"],
+            name="Exchange",
+            marker_color="rgba(0,255,136,0.6)",
+        )
+        fig_flow.add_bar(
+            x=flow_hist_df["timestamp"],
+            y=flow_hist_df["ripple_corp_xrp"],
+            name="Ripple OTC",
+            marker_color="rgba(255,255,255,0.35)",
+        )
+        fig_flow.update_layout(
+            barmode="stack",
+            template="plotly_dark",
+            height=280,
+            margin=dict(l=30, r=20, t=30, b=30),
+            legend_orientation="h",
+        )
+        st.plotly_chart(fig_flow, use_container_width=True)
+    else:
+        st.info("XRPL flow history unavailable.")
+
+with flow_meta_col:
+    metric_card(
+        "Flow Z-Score (7d)",
+        f"{flow_breakdown.get('total_z', 0.0):+.2f}",
+        sub=f"Exch {flow_breakdown.get('exchange_z', 0.0):+.2f} • OTC {flow_breakdown.get('otc_z', 0.0):+.2f}",
+    )
+    metric_card(
+        "OI Δ", f"{oi_delta_24h:+.1f}%" if oi_delta_24h is not None else "N/A", sub="24h change"
+    )
+    metric_card(
+        "Netflow Δ",
+        f"{netflow_delta_24h:+.1f}%" if netflow_delta_24h is not None else "N/A",
+        sub="Binance 24h",
+    )
+    metric_card(
+        "Funding Δ",
+        f"{funding_delta_7d:+.1f}%" if funding_delta_7d is not None else "N/A",
+        sub="7d drift",
+    )
 
 # Score + composition
 score_col, signal_col = st.columns([1, 2])
@@ -1107,12 +1496,31 @@ with score_col:
         f'<p style="font-size:86px;color:{color};text-align:center;font-weight:bold;">{total_score:.0f}</p>',
         unsafe_allow_html=True,
     )
+    st.metric(
+        "Conviction Probability",
+        f"{conviction_prob * 100:.1f}%",
+        help="Calibrated from composite score, sentiment, and flow intensity",
+    )
+    st.metric(
+        "ATR Risk Band",
+        risk_profile.get("band"),
+        f"ATR {risk_profile.get('atr_pct', 0.0):.1f}%" if risk_profile.get("atr_pct") else "N/A",
+    )
 with signal_col:
     st.markdown(
         f'<h2 style="color:{color};margin-top:30px;">{signal}</h2>',
         unsafe_allow_html=True,
     )
     st.write(f"Funding Z-Score: {fund_z:+.2f}")
+    if regimes:
+        st.markdown("**Regime Overlays**")
+        for label, desc, severity in regimes:
+            bg = "rgba(0,255,136,0.18)" if severity == "ok" else ("rgba(234,179,8,0.2)" if severity == "warn" else "rgba(239,68,68,0.2)")
+            st.markdown(
+                f"<div style='padding:8px 10px;border-radius:8px;margin-bottom:6px;background:{bg};'>"
+                f"<strong>{label}</strong><br/><span style='font-size:12px;color:#d0d5dd;'>{desc}</span></div>",
+                unsafe_allow_html=True,
+            )
     score_df = (
         pd.DataFrame({"Component": points.keys(), "Points": points.values()})
         .sort_values("Points", ascending=False)
@@ -1153,6 +1561,44 @@ with st.expander("Live Signal Breakdown (raw)", expanded=False):
         a.write(k)
         b.write("Quiet" if v == 0 else str(v))
 
+with st.expander("Sentiment Drill-down", expanded=False):
+    st.write("Top weighted headlines driving the sentiment EMA. Use the toggle to drop low-confidence sources.")
+    exclude_low_conf = st.checkbox("Hide weights < 0.35", value=True)
+    filtered_articles = [
+        a for a in articles if a.get("scalar") is not None and (not exclude_low_conf or (a.get("weight", 0.0) or 0.0) >= 0.35)
+    ]
+    if not filtered_articles:
+        st.info("No scored headlines available yet.")
+    else:
+        bucket_ts = news_payload.get("timestamp")
+        bucket_label = "Latest sentiment window"
+        if bucket_ts:
+            try:
+                ts_dt = datetime.fromisoformat(str(bucket_ts).replace("Z", "+00:00"))
+                delta_m = (datetime.now(timezone.utc) - ts_dt).total_seconds() / 60
+                bucket_label = f"Updated {delta_m:.0f} minutes ago"
+            except Exception:
+                bucket_label = "Latest sentiment window"
+
+        top_pos = sorted(filtered_articles, key=lambda a: a.get("scalar", 0.0), reverse=True)[:3]
+        top_neg = sorted(filtered_articles, key=lambda a: a.get("scalar", 0.0))[:3]
+
+        cpos, cneg = st.columns(2)
+        with cpos:
+            st.markdown("**Top Positive**")
+            for art in top_pos:
+                st.markdown(
+                    f"• {art.get('title', 'N/A')}  \\n+                    <span style='color:#9ca3af;font-size:12px;'>Src {art.get('source','?')} • w={art.get('weight',0):.2f} • {bucket_label}</span>",
+                    unsafe_allow_html=True,
+                )
+        with cneg:
+            st.markdown("**Top Negative**")
+            for art in top_neg:
+                st.markdown(
+                    f"• {art.get('title', 'N/A')}  \\n+                    <span style='color:#9ca3af;font-size:12px;'>Src {art.get('source','?')} • w={art.get('weight',0):.2f} • {bucket_label}</span>",
+                    unsafe_allow_html=True,
+                )
+
 # =========================
 # Simple SMA Backtest on Price
 # =========================
@@ -1160,7 +1606,9 @@ with st.expander("Live Signal Breakdown (raw)", expanded=False):
 st.markdown("### 90-Day SMA + Volume Backtest (Price-only Approximation)")
 
 
-def run_sma_backtest(df: pd.DataFrame, fast: int = 7, slow: int = 21):
+def run_sma_backtest(
+    df: pd.DataFrame, fast: int = 7, slow: int = 21, gate: Optional[pd.Series] = None
+):
     if df.empty or len(df) < slow:
         return {
             "num_trades": 0,
@@ -1177,7 +1625,12 @@ def run_sma_backtest(df: pd.DataFrame, fast: int = 7, slow: int = 21):
     df["sma_slow"] = df["close"].rolling(slow).mean()
 
     valid = df["sma_fast"].notna() & df["sma_slow"].notna()
-    df["signal"] = np.where(valid & (df["sma_fast"] > df["sma_slow"]), 1, 0)
+    if gate is not None:
+        gate_aligned = gate.reindex(df.index).fillna(False)
+    else:
+        gate_aligned = pd.Series(True, index=df.index)
+
+    df["signal"] = np.where(valid & gate_aligned & (df["sma_fast"] > df["sma_slow"]), 1, 0)
     df["signal_shift"] = df["signal"].shift(1, fill_value=0)
 
     df["ret"] = df["close"].pct_change().fillna(0.0)
@@ -1267,6 +1720,23 @@ if not bt["equity"].empty:
         yaxis_title="Equity (start=100)",
     )
     st.plotly_chart(eq_fig, use_container_width=True)
+
+if proxy_composite is not None:
+    st.markdown("#### Composite-gated SMA variants")
+    gate65 = proxy_composite >= 65
+    gate80 = proxy_composite >= 80
+    bt65 = run_sma_backtest(chart_df, gate=gate65)
+    bt80 = run_sma_backtest(chart_df, gate=gate80)
+
+    g1, g2 = st.columns(2)
+    with g1:
+        st.metric("Signals (≥65)", bt65["num_trades"], help="Only take SMA longs when proxy composite ≥ 65")
+        st.metric("Win % (≥65)", f"{bt65['win_rate']:.1f}%")
+        st.metric("Avg Return (≥65)", f"{bt65['avg_return']:+.1f}%")
+    with g2:
+        st.metric("Signals (≥80)", bt80["num_trades"], help="Only take SMA longs when proxy composite ≥ 80")
+        st.metric("Win % (≥80)", f"{bt80['win_rate']:.1f}%")
+        st.metric("Avg Return (≥80)", f"{bt80['avg_return']:+.1f}%")
 
 # =========================
 # XRPL inflow table
