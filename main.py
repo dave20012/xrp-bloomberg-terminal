@@ -106,16 +106,15 @@ with st.sidebar:
     st.subheader("Config & Credentials")
     api_key = normalize_env_value("BINANCE_API_KEY")
     api_secret = normalize_env_value("BINANCE_API_SECRET")
-    cred_warning = validate_binance_credentials(api_key, api_secret)
     st.caption("Binance keys are read from environment variables; secrets are redacted for safety.")
     st.code(
         f"BINANCE_API_KEY={redact_secret(api_key)}\nBINANCE_API_SECRET={redact_secret(api_secret)}",
         language="bash",
     )
-    if cred_warning:
-        st.warning(cred_warning)
+    if api_key and api_secret:
+        st.success("Binance credentials loaded from environment variables.")
     else:
-        st.success("Binance credentials look well-formed.")
+        st.info("Set BINANCE_API_KEY and BINANCE_API_SECRET to enable live netflow polling.")
 
 refresh_seconds = st.session_state["refresh_seconds"]
 if st.session_state["refresh_enabled"]:
@@ -1060,15 +1059,12 @@ def fetch_live():
     # Binance signed netflow (XRP)
     api_key = normalize_env_value("BINANCE_API_KEY")
     api_secret = normalize_env_value("BINANCE_API_SECRET")
-    binance_issue = None
-    if api_key and api_secret:
-        binance_issue = validate_binance_credentials(api_key, api_secret)
-    else:
+    if not (api_key and api_secret):
         result["binance_notes"].append(
             "Binance netflow requires BINANCE_API_KEY and BINANCE_API_SECRET; showing cached data when available."
         )
 
-    if api_key and api_secret and not binance_issue:
+    if api_key and api_secret:
         try:
             base = "https://api.binance.com"
 
@@ -1112,10 +1108,6 @@ def fetch_live():
             write_cached_binance_netflow(netflow_val)
         except Exception:
             pass
-    elif binance_issue:
-        logger.warning(binance_issue)
-        result["binance_notes"].append(binance_issue)
-
     if result["binance_netflow_24h"] is None:
         cached_val, cached_ts = read_cached_binance_netflow()
         if cached_val is not None:
@@ -1124,9 +1116,6 @@ def fetch_live():
                 result["binance_notes"].append(
                     f"Using cached Binance netflow from {cached_ts}."
                 )
-        elif binance_issue:
-            result["binance_notes"].append("Binance netflow unavailable; see warning above.")
-
     # XRPL inflows (from Redis, new v9.3 schema)
     try:
         raw = rdb.get("xrpl:latest_inflows")
