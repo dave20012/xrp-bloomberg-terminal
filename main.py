@@ -415,28 +415,40 @@ def fetch_funding_and_oi() -> Dict[str, Optional[float]]:
         except Exception:  # noqa: BLE001
             return None
 
-    try:
-        resp = requests.get(
+    funding_endpoints = [
+        (
+            f"{BINANCE_FAPI}/fapi/v1/fundingRate",
+            {"symbol": "XRPUSDT", "limit": 1},
+            lambda payload: _to_float(payload[0].get("fundingRate"))
+            if isinstance(payload, list) and payload
+            else None,
+        ),
+        (
+            f"{BINANCE_FAPI}/fapi/v1/premiumIndex",
+            {"symbol": "XRPUSDT"},
+            lambda payload: _to_float(payload.get("lastFundingRate"))
+            if isinstance(payload, dict)
+            else None,
+        ),
+        (
             f"{BINANCE_FAPI}/futures/data/fundingRate",
-            params={"symbol": "XRPUSDT", "limit": 1},
-            timeout=REQUEST_TIMEOUT,
-        )
-        if resp.ok and resp.json():
-            funding_raw = resp.json()[0]
-            funding = _to_float(funding_raw.get("fundingRate"))
-    except Exception:  # noqa: BLE001
-        funding = None
+            {"symbol": "XRPUSDT", "limit": 1},
+            lambda payload: _to_float(payload[0].get("fundingRate"))
+            if isinstance(payload, list) and payload
+            else None,
+        ),
+    ]
 
-    if funding is None:
+    for url, params, extractor in funding_endpoints:
+        if funding is not None:
+            break
         try:
-            resp = requests.get(
-                f"{BINANCE_FAPI}/fapi/v1/premiumIndex",
-                params={"symbol": "XRPUSDT"},
-                timeout=REQUEST_TIMEOUT,
-            )
-            if resp.ok:
-                payload = resp.json() or {}
-                funding = _to_float(payload.get("lastFundingRate"))
+            resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            if not resp.ok:
+                continue
+
+            payload = resp.json() or {}
+            funding = extractor(payload)
         except Exception:  # noqa: BLE001
             funding = None
 
