@@ -1135,6 +1135,10 @@ append_metric_history("oi_usd", live.get("oi_usd"))
 append_metric_history("funding_now_pct", live.get("funding_now_pct"))
 append_metric_history("binance_netflow_24h", live.get("binance_netflow_24h"))
 
+append_metric_history("oi_usd", live.get("oi_usd"))
+append_metric_history("funding_now_pct", live.get("funding_now_pct"))
+append_metric_history("binance_netflow_24h", live.get("binance_netflow_24h"))
+
 # =========================
 # News sentiment from Redis + EMA
 # =========================
@@ -1706,6 +1710,23 @@ if not bt["equity"].empty:
         yaxis_title="Equity (start=100)",
     )
     st.plotly_chart(eq_fig, use_container_width=True)
+
+if proxy_composite is not None:
+    st.markdown("#### Composite-gated SMA variants")
+    gate65 = proxy_composite >= 65
+    gate80 = proxy_composite >= 80
+    bt65 = run_sma_backtest(chart_df, gate=gate65)
+    bt80 = run_sma_backtest(chart_df, gate=gate80)
+
+    g1, g2 = st.columns(2)
+    with g1:
+        st.metric("Signals (≥65)", bt65["num_trades"], help="Only take SMA longs when proxy composite ≥ 65")
+        st.metric("Win % (≥65)", f"{bt65['win_rate']:.1f}%")
+        st.metric("Avg Return (≥65)", f"{bt65['avg_return']:+.1f}%")
+    with g2:
+        st.metric("Signals (≥80)", bt80["num_trades"], help="Only take SMA longs when proxy composite ≥ 80")
+        st.metric("Win % (≥80)", f"{bt80['win_rate']:.1f}%")
+        st.metric("Avg Return (≥80)", f"{bt80['avg_return']:+.1f}%")
 
 if proxy_composite is not None:
     st.markdown("#### Composite-gated SMA variants")
