@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -7,6 +8,18 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 from redis_client import rdb
+
+
+def normalize_env_value(name: str) -> str:
+    """Return a trimmed environment variable (blank string if missing)."""
+
+    raw = (os.getenv(name) or "").strip()
+
+    # Railway variables sometimes get pasted with surrounding quotes.
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {'"', "'"}:
+        raw = raw[1:-1].strip()
+
+    return raw
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:

@@ -1,10 +1,24 @@
 """Unit coverage for app_utils helper functions."""
 
+import os
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 import app_utils
+
+
+class NormalizeEnvValueTests(unittest.TestCase):
+    @mock.patch.dict(os.environ, {"BINANCE_API_KEY": "  abc123  "})
+    def test_trims_whitespace(self):
+        self.assertEqual(app_utils.normalize_env_value("BINANCE_API_KEY"), "abc123")
+
+    @mock.patch.dict(os.environ, {"BINANCE_API_SECRET": "'pasted-secret'"})
+    def test_strips_surrounding_quotes(self):
+        self.assertEqual(app_utils.normalize_env_value("BINANCE_API_SECRET"), "pasted-secret")
+
+    def test_handles_missing_env(self):
+        self.assertEqual(app_utils.normalize_env_value("DOES_NOT_EXIST"), "")
 
 
 class SafeGetTests(unittest.TestCase):
