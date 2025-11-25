@@ -23,9 +23,10 @@ from app_utils import resolve_sentiment_conflicts
 from redis_client import rdb
 from signals import (
     SIGNAL_COMPONENTS,
-    calibrated_conviction_probability,
     log_score_components,
+    posterior_conviction_probability,
 )
+from targets import build_target_profile, compute_atr
 
 # =========================
 # Config / constants
@@ -359,64 +360,6 @@ def _linear_window_score(value: Optional[float], start: float, end: float, max_s
     ratio = (val - lower) / (upper - lower)
     score = max_score * (1.0 - ratio if start < end else ratio)
     return float(max(0.0, min(max_score, score)))
-
-
-def compute_atr(df: pd.DataFrame, period: int = 14) -> Optional[float]:
-    """Return the latest Average True Range from OHLC data."""
-
-    if df is None or df.empty or not {"high", "low", "close"}.issubset(df.columns):
-        return None
-
-    df_sorted = df.sort_values("date")
-    high = df_sorted["high"].astype(float)
-    low = df_sorted["low"].astype(float)
-    close = df_sorted["close"].astype(float)
-    prev_close = close.shift(1)
-
-    tr = pd.DataFrame(
-        {
-            "hl": high - low,
-            "hc": (high - prev_close).abs(),
-            "lc": (low - prev_close).abs(),
-        }
-    ).max(axis=1)
-
-    atr = tr.rolling(period).mean().iloc[-1]
-    return float(atr) if not pd.isna(atr) else None
-
-
-def risk_bands(price: Optional[float], atr: Optional[float]) -> Dict[str, Any]:
-    """Return ATR-based entry/TP/stop bands and a risk classification."""
-
-    if price is None or atr is None or price <= 0 or atr <= 0:
-        return {
-            "band": "N/A",
-            "atr_pct": None,
-            "entry": None,
-            "tp": None,
-            "stop": None,
-            "text": "ATR unavailable; waiting for sufficient OHLC candles.",
-        }
-
-    atr_pct = atr / price * 100.0
-    if atr_pct >= 12:
-        band = "High Volatility"
-    elif atr_pct >= 7:
-        band = "Elevated"
-    else:
-        band = "Contained"
-
-    tp = price + atr * 1.5
-    stop = max(price - atr, 0)
-
-    return {
-        "band": band,
-        "atr_pct": atr_pct,
-        "entry": price,
-        "tp": tp,
-        "stop": stop,
-        "text": f"ATR {atr_pct:.1f}% of price — {band} regime",
-    }
 
 
 def append_metric_history(name: str, value: Optional[float], max_age_days: int = 7, max_len: int = 480) -> None:
@@ -1301,7 +1244,7 @@ netflow_score = min(
     max(
         0.0,
         (-(live.get("binance_netflow_24h") or 0.0))
-        / 15e6
+        / 100e6
         * SIGNAL_COMPONENTS["netflow"].max_points,
     ),
 )
@@ -1328,13 +1271,24 @@ points = {
 total_score = float(min(100.0, sum(points.values())))
 log_score_components(points)
 
+close_series = chart_df["close"] if not chart_df.empty and "close" in chart_df else None
 atr_val = compute_atr(chart_df)
-last_price = live.get("price") or (float(chart_df["close"].iloc[-1]) if not chart_df.empty else None)
-risk_profile = risk_bands(last_price, atr_val)
+last_price = live.get("price") or (float(close_series.iloc[-1]) if close_series is not None else None)
+risk_profile = build_target_profile(
+    last_price,
+    atr_val,
+    ratio_bias=avg_positive_uplift,
+    closes=close_series,
+)
 
-conviction_prob = calibrated_conviction_probability(total_score)
-conviction_prob *= 1.0 + max(0.0, ema_sent) * 0.2 + max(0.0, weighted_inflow_m) / 200.0
-conviction_prob = float(min(0.98, max(0.02, conviction_prob)))
+conviction_prob = posterior_conviction_probability(
+    total_score=total_score,
+    fund_z=fund_z,
+    netflow_score=netflow_score,
+    oi_score=oi_score,
+    sentiment_score=sentiment_score,
+    ratio_uplift=avg_positive_uplift,
+)
 
 oi_delta_24h = metric_delta("oi_usd", 24)
 netflow_delta_24h = metric_delta("binance_netflow_24h", 24)
@@ -1497,6 +1451,23 @@ with score_col:
         risk_profile.get("band"),
         f"ATR {risk_profile.get('atr_pct', 0.0):.1f}%" if risk_profile.get("atr_pct") else "N/A",
     )
+    if risk_profile.get("entry"):
+        st.metric(
+            "Targets",
+            f"Entry ${risk_profile['entry']:.3f}",
+            help=risk_profile.get("text"),
+        )
+    else:
+        st.metric("Targets", "N/A", help=risk_profile.get("text"))
+    risk_stats = risk_profile.get("risk", {}) or {}
+    if risk_stats.get("win_rate") is not None and risk_stats.get("max_drawdown_pct") is not None:
+        st.metric(
+            "Win / Drawdown",
+            f"{risk_stats['win_rate']:.0f}% / {risk_stats['max_drawdown_pct']:.1f}%",
+            help="Historical close-series win rate vs. daily changes and max drawdown.",
+        )
+    else:
+        st.metric("Win / Drawdown", "N/A", help="Waiting for sufficient close history.")
 with signal_col:
     st.markdown(
         f'<h2 style="color:{color};margin-top:30px;">{signal}</h2>',
