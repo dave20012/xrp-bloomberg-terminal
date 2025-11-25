@@ -42,10 +42,52 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-META_REFRESH_SECONDS = int(os.getenv("META_REFRESH_SECONDS", "45"))
-st.markdown(f'<meta http-equiv="refresh" content="{META_REFRESH_SECONDS}">', unsafe_allow_html=True)
+DEFAULT_META_REFRESH_SECONDS = int(os.getenv("META_REFRESH_SECONDS", "45"))
+if "refresh_enabled" not in st.session_state:
+    st.session_state["refresh_enabled"] = True
+if "refresh_seconds" not in st.session_state:
+    st.session_state["refresh_seconds"] = DEFAULT_META_REFRESH_SECONDS
+
+with st.sidebar:
+    st.header("Live Controls")
+    st.session_state["refresh_enabled"] = st.checkbox(
+        "Enable auto-refresh",
+        value=st.session_state["refresh_enabled"],
+        help="Disable if you want to freeze the dashboard while investigating a scenario.",
+    )
+    st.session_state["refresh_seconds"] = st.slider(
+        "Refresh interval (seconds)",
+        min_value=15,
+        max_value=180,
+        value=st.session_state["refresh_seconds"],
+        step=5,
+        help="Lower values increase API usage and rate-limit risk.",
+    )
+    if st.button("Refresh now", type="primary"):
+        st.experimental_rerun()
+
+    st.subheader("Config & Credentials")
+    api_key = normalize_env_value("BINANCE_API_KEY")
+    api_secret = normalize_env_value("BINANCE_API_SECRET")
+    cred_warning = validate_binance_credentials(api_key, api_secret)
+    st.caption("Binance keys are read from environment variables; secrets are redacted for safety.")
+    st.code(
+        f"BINANCE_API_KEY={redact_secret(api_key)}\nBINANCE_API_SECRET={redact_secret(api_secret)}",
+        language="bash",
+    )
+    if cred_warning:
+        st.warning(cred_warning)
+    else:
+        st.success("Binance credentials look well-formed.")
+
+refresh_seconds = st.session_state["refresh_seconds"]
+if st.session_state["refresh_enabled"]:
+    st.markdown(
+        f'<meta http-equiv="refresh" content="{refresh_seconds}">',
+        unsafe_allow_html=True,
+    )
 st.caption(
-    f"Dashboard auto-refreshes every {META_REFRESH_SECONDS} seconds; lower values increase API usage."
+    f"Dashboard auto-refreshes every {refresh_seconds} seconds; lower values increase API usage."
 )
 
 st.markdown(
@@ -99,13 +141,19 @@ def section_label(text: str) -> None:
     st.markdown(f"<div class='section-label'>{text}</div>", unsafe_allow_html=True)
 
 
-def render_health_strip(issues: List[str], redis_notes: List[str], binance_notes: List[str]) -> None:
+def render_health_strip(
+    issues: List[str],
+    redis_notes: List[str],
+    binance_notes: List[str],
+    latency_notes: Optional[List[str]] = None,
+    freshness_notes: Optional[List[str]] = None,
+) -> None:
     """Compact health strip showing data and API state."""
 
     status = "OK" if not issues else "WARN"
     pill_class = "health-ok" if status == "OK" else "health-warn"
     with st.container():
-        cols = st.columns([2, 3, 3])
+        cols = st.columns([2, 3, 3, 2])
         cols[0].markdown(
             f"<span class='health-pill {pill_class}'>System {status}</span>",
             unsafe_allow_html=True,
@@ -117,13 +165,20 @@ def render_health_strip(issues: List[str], redis_notes: List[str], binance_notes
         else:
             cols[1].markdown("**Data Issues**\\n- None detected")
 
-        combined_notes = (redis_notes or []) + (binance_notes or [])
+        combined_notes = (redis_notes or []) + (binance_notes or []) + (freshness_notes or [])
         if combined_notes:
             cols[2].markdown(
                 "**Cache / API Notes**\\n" + "\\n".join(f"- {n}" for n in combined_notes)
             )
         else:
             cols[2].markdown("**Cache / API Notes**\\n- All clear")
+
+        if latency_notes:
+            cols[3].markdown(
+                "**Latency**\\n" + "\\n".join(f"- {n}" for n in latency_notes)
+            )
+        else:
+            cols[3].markdown("**Latency**\\n- n/a")
 
 
 def normalize_env_value(name: str) -> str:
@@ -136,6 +191,16 @@ def normalize_env_value(name: str) -> str:
         raw = raw[1:-1].strip()
 
     return raw
+
+
+def redact_secret(value: str, keep: int = 4) -> str:
+    """Return a partially redacted secret for safe display."""
+
+    if not value:
+        return "<empty>"
+    if len(value) <= keep * 2:
+        return "*" * len(value)
+    return f"{value[:keep]}***{value[-keep:]}"
 
 
 def validate_binance_credentials(api_key: str, api_secret: str) -> Optional[str]:
@@ -188,6 +253,8 @@ def empty_live_payload() -> Dict[str, Any]:
         "xrpl_raw_inflow": 0.0,
         "xrpl_weighted_inflow": 0.0,
         "xrpl_ripple_otc": 0.0,
+        "latency_notes": [],
+        "freshness_notes": [],
     }
 
 
@@ -270,6 +337,16 @@ def read_cached_value(key: str, ttl_seconds: int) -> Optional[Any]:
     ts = float(cached.get("ts", 0.0))
     if time.time() - ts <= ttl_seconds:
         return cached.get("value")
+    return None
+
+
+def cache_age_seconds(key: str, ts_field: str = "ts") -> Optional[float]:
+    cached = cache_get_json(key)
+    if isinstance(cached, dict) and cached.get(ts_field) is not None:
+        try:
+            return float(time.time() - float(cached.get(ts_field, 0.0)))
+        except Exception:
+            return None
     return None
 
 
@@ -663,6 +740,29 @@ def describe_data_health(live: Dict[str, Any], news_payload: Dict[str, Any]) -> 
 
     return issues, redis_notes
 
+
+def collect_freshness_notes() -> List[str]:
+    """Summaries about cache ages to spot stale datasets quickly."""
+
+    notes: List[str] = []
+    price_age = cache_age_seconds("cache:price:xrp_usd")
+    if price_age is not None:
+        notes.append(f"Cached price age {price_age:.0f}s")
+
+    funding_age = cache_age_seconds("cache:funding_now_pct")
+    if funding_age is not None:
+        notes.append(f"Funding age {funding_age:.0f}s")
+
+    oi_age = cache_age_seconds("cache:oi_usd")
+    if oi_age is not None:
+        notes.append(f"Open interest age {oi_age:.0f}s")
+
+    sentiment_age = cache_age_seconds("news:sentiment_ema")
+    if sentiment_age is not None:
+        notes.append(f"Sentiment EMA age {sentiment_age:.0f}s")
+
+    return notes
+
 # =========================
 # Chart data (90d OHLC + volume)
 # =========================
@@ -804,9 +904,13 @@ def fetch_live():
     - XRPL inflows (raw/weighted) and Ripple OTC flows from Redis
     """
     result = empty_live_payload()
+    latency_notes = result["latency_notes"]
+    freshness_notes = result["freshness_notes"]
 
     # Price with Redis fallback and throttled CoinGecko usage, then Binance/CryptoCompare
+    start_ts = time.perf_counter()
     price_resp = cached_coingecko_simple_price("ripple")
+    latency_notes.append(f"CoinGecko price {time.perf_counter() - start_ts:.2f}s")
     if price_resp and "ripple" in price_resp:
         try:
             px = float(price_resp["ripple"]["usd"])
@@ -839,6 +943,9 @@ def fetch_live():
         cached = cache_get_json("cache:price:xrp_usd")
         if cached:
             result["price"] = float(cached.get("price", 0.0))
+            age = cache_age_seconds("cache:price:xrp_usd")
+            if age is not None:
+                freshness_notes.append(f"Price cached age {age:.0f}s")
 
     # XRP/BTC, XRP/ETH ratios and ratio EMAs (throttled)
     ratio_resp = cached_coingecko_simple_price("ripple,bitcoin,ethereum")
@@ -878,10 +985,12 @@ def fetch_live():
                 pass
 
     # Funding rate
+    start_ts = time.perf_counter()
     fr_json = safe_get(
         "https://fapi.binance.com/fapi/v1/premiumIndex",
         {"symbol": "XRPUSDT"},
     )
+    latency_notes.append(f"Funding {time.perf_counter() - start_ts:.2f}s")
     if fr_json and "lastFundingRate" in fr_json:
         try:
             result["funding_now_pct"] = float(fr_json["lastFundingRate"]) * 100
@@ -895,10 +1004,12 @@ def fetch_live():
             result["binance_notes"].append("Funding rate sourced from cached Binance response (API unavailable).")
 
     # Open interest
+    start_ts = time.perf_counter()
     oi_json = safe_get(
         "https://fapi.binance.com/fapi/v1/openInterest",
         {"symbol": "XRPUSDT"},
     )
+    latency_notes.append(f"Open interest {time.perf_counter() - start_ts:.2f}s")
     if oi_json and "openInterest" in oi_json:
         try:
             oi_contracts = float(oi_json["openInterest"])
@@ -914,10 +1025,12 @@ def fetch_live():
             result["binance_notes"].append("Open interest sourced from cached Binance response (API unavailable).")
 
     # Funding history
+    start_ts = time.perf_counter()
     fh_json = safe_get(
         "https://fapi.binance.com/fapi/v1/fundingRate",
         {"symbol": "XRPUSDT", "limit": 200},
     )
+    latency_notes.append(f"Funding history {time.perf_counter() - start_ts:.2f}s")
     if fh_json:
         try:
             rates = [float(x["fundingRate"]) * 100 for x in fh_json[-90:]]
@@ -1102,6 +1215,21 @@ def write_sentiment_ema(value: float):
         "news:sentiment_ema",
         {"ema": float(value), "timestamp": datetime.now(timezone.utc).isoformat()},
     )
+
+
+def read_etf_metrics() -> Dict[str, Any]:
+    payload = cache_get_json("etf:xrp_metrics") or {}
+    if not isinstance(payload, dict):
+        payload = {}
+    return {
+        "provider": payload.get("provider", "Aggregated"),
+        "aum_usd": payload.get("aum_usd"),
+        "volume_usd": payload.get("volume_usd"),
+        "premium_pct": payload.get("premium_pct"),
+        "daily_flow_usd": payload.get("daily_flow_usd"),
+        "nav_usd": payload.get("nav_usd"),
+        "updated_at": payload.get("updated_at"),
+    }
 
 
 news_payload = read_sentiment()
@@ -1310,11 +1438,96 @@ regimes = detect_regimes(
 # =========================
 
 issues, redis_notes = describe_data_health(live, news_payload)
-render_health_strip(issues, redis_notes, live.get("binance_notes") or [])
+freshness_notes = (live.get("freshness_notes") or []) + collect_freshness_notes()
+render_health_strip(
+    issues,
+    redis_notes,
+    live.get("binance_notes") or [],
+    latency_notes=live.get("latency_notes"),
+    freshness_notes=freshness_notes,
+)
+st.caption(f"Last updated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC")
 
 # =========================
 # UI — Redesigned layout
 # =========================
+
+def _fmt_usd(value: Optional[float]) -> str:
+    if value is None:
+        return "N/A"
+    try:
+        return f"${value:,.0f}"
+    except Exception:
+        return "N/A"
+
+
+def render_sparkline_from_history(name: str, title: str, color: str = "#00ff88") -> None:
+    history = cache_get_json(f"history:metric:{name}")
+    if not history:
+        st.info(f"No history for {title} yet.")
+        return
+    df = pd.DataFrame(history)
+    if df.empty or "value" not in df:
+        st.info(f"No history for {title} yet.")
+        return
+    df["ts"] = pd.to_datetime(df["ts"], unit="s", errors="coerce")
+    df = df.dropna(subset=["ts"])
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=df["ts"],
+            y=df["value"],
+            mode="lines",
+            line=dict(color=color, width=2),
+            fill="tozeroy",
+            fillcolor="rgba(0,255,136,0.12)",
+        )
+    )
+    fig.update_layout(
+        margin=dict(l=10, r=10, t=20, b=10),
+        height=160,
+        template="plotly_dark",
+        showlegend=False,
+        xaxis_title="",
+        yaxis_title="",
+    )
+    st.markdown(f"**{title}**")
+    st.plotly_chart(fig, use_container_width=True)
+
+
+etf_metrics = read_etf_metrics()
+with st.expander("XRP ETF market", expanded=True):
+    section_label(f"Provider: {etf_metrics.get('provider', 'Aggregated')}")
+    etf_cols = st.columns(4)
+    etf_cols[0].metric(
+        "AUM",
+        _fmt_usd(etf_metrics.get("aum_usd")),
+    )
+    etf_cols[1].metric(
+        "Daily Flow",
+        _fmt_usd(etf_metrics.get("daily_flow_usd")),
+    )
+    etf_cols[2].metric(
+        "Secondary Volume",
+        _fmt_usd(etf_metrics.get("volume_usd")),
+    )
+    premium = etf_metrics.get("premium_pct")
+    etf_cols[3].metric(
+        "Premium / Discount",
+        f"{premium:+.2f}%" if premium is not None else "N/A",
+    )
+    nav = etf_metrics.get("nav_usd")
+    st.caption(
+        f"NAV: {_fmt_usd(nav)} • Updated {etf_metrics.get('updated_at', 'n/a')}"
+    )
+
+spark_cols = st.columns(3)
+with spark_cols[0]:
+    render_sparkline_from_history("oi_usd", "Open Interest (7d)")
+with spark_cols[1]:
+    render_sparkline_from_history("funding_now_pct", "Funding % (7d)")
+with spark_cols[2]:
+    render_sparkline_from_history("binance_netflow_24h", "Binance Netflow (7d)")
 
 section_label("Market overview")
 o1, o2, o3 = st.columns([1.2, 1, 1])
@@ -1322,7 +1535,7 @@ with o1:
     metric_card(
         "XRP Price",
         f"${live.get('price', 0.0):.4f}" if live.get("price") else "—",
-        sub=f"Refresh {META_REFRESH_SECONDS}s • Funding {live.get('funding_now_pct', 0.0):+.4f}%",
+        sub=f"Refresh {refresh_seconds}s • Funding {live.get('funding_now_pct', 0.0):+.4f}%",
     )
     metric_card("Open Interest", f"${(live.get('oi_usd') or 0.0)/1e9:.2f}B", "Binance futures OI")
 with o2:
