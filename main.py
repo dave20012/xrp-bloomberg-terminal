@@ -247,6 +247,45 @@ def compute_sentiment_components(articles: List[Dict[str, Any]], mode: str) -> T
     return float(inst), float(bull), float(bear)
 
 
+def _capped_positive_score(value: float, scale: float, cap: float) -> float:
+    """Return a smooth, capped score for positive signals (e.g., z-scores).
+
+    The tanh keeps extreme values from dominating while still rewarding
+    outsized moves. Negative inputs return zero because they are not helpful
+    to the bullish thesis.
+    """
+
+    if value is None:
+        return 0.0
+    scaled = np.tanh(float(value)) * scale
+    return float(min(cap, max(0.0, scaled)))
+
+
+def _linear_window_score(value: Optional[float], start: float, end: float, max_score: float) -> float:
+    """Map ``value`` onto a linear window between ``start`` and ``end``.
+
+    ``start`` receives the full ``max_score`` while ``end`` and beyond drop to
+    zero. Values between are interpolated. If ``start`` < ``end`` the score
+    decays as value increases; otherwise it increases.
+    """
+
+    if value is None:
+        return 0.0
+    if start == end:
+        return float(max_score if value <= start else 0.0)
+
+    val = float(value)
+    lower, upper = (start, end) if start < end else (end, start)
+    if val <= lower:
+        return float(max_score if start < end else 0.0)
+    if val >= upper:
+        return float(0.0 if start < end else max_score)
+
+    ratio = (val - lower) / (upper - lower)
+    score = max_score * (1.0 - ratio if start < end else ratio)
+    return float(max(0.0, min(max_score, score)))
+
+
 def _parse_inflow_timestamp(value: Any) -> Optional[datetime]:
     """Return a timezone-aware datetime for inflow timestamps (epoch or ISO)."""
 
@@ -853,21 +892,35 @@ fund_now = live.get("funding_now_pct") or 0.0
 fund_z = (fund_now - np.mean(fund_hist)) / (
     np.std(fund_hist) if np.std(fund_hist) > 1e-8 else 1e-8
 )
+funding_score = _capped_positive_score(fund_z, scale=22.0, cap=22.0)
+
+whale_flow_score = min(
+    14.0, max(0.0, (live.get("xrpl_weighted_inflow") or 0.0) / 60e6 * 14.0)
+)
+
+price_score = _linear_window_score(live.get("price"), start=2.45, end=3.0, max_score=28.0)
+
+oi_score = _linear_window_score(
+    (live.get("oi_usd") or 0.0) / 1e9, start=2.7, end=1.5, max_score=16.0
+)
+
+netflow_score = min(
+    30.0, max(0.0, (live.get("binance_netflow_24h") or 0.0) / 100e6 * 30.0)
+)
+
+ls_ratio = live.get("long_short_ratio", 1.0) or 0.0
+short_squeeze_score = min(20.0, max(0.0, (2.0 - ls_ratio) * 20.0))
+
+sentiment_score = _linear_window_score(ema_sent, start=0.3, end=0.05, max_score=15.0)
 
 points = {
-    "Funding Z-Score": max(0.0, fund_z * 22.0),
-    "Whale Flow (XRPL, weighted)": max(
-        0.0, (live.get("xrpl_weighted_inflow") or 0.0) / 60e6 * 14.0
-    ),
-    "Price < $2.45": 28.0 if (live.get("price") or 0.0) < 2.45 else 0.0,
-    "OI > $2.7B": 16.0 if (live.get("oi_usd") or 0.0) > 2.7e9 else 0.0,
-    "Binance Netflow Bullish": max(
-        0.0, (live.get("binance_netflow_24h") or 0.0) / 100e6 * 30.0
-    ),
-    "Short Squeeze Setup": max(
-        0.0, (2.0 - live.get("long_short_ratio", 1.0)) * 20.0
-    ),
-    "Positive News (EMA)": 15.0 if ema_sent > 0.2 else 0.0,
+    "Funding Z-Score": funding_score,
+    "Whale Flow (XRPL, weighted)": whale_flow_score,
+    "Price < $2.45": price_score,
+    "OI > $2.7B": oi_score,
+    "Binance Netflow Bullish": netflow_score,
+    "Short Squeeze Setup": short_squeeze_score,
+    "Positive News (EMA)": sentiment_score,
     "Flippening Flow": flip_score,
 }
 total_score = float(min(100.0, sum(points.values())))
@@ -1000,7 +1053,7 @@ chart_df = get_chart_data()
 
 
 def run_sma_backtest(df: pd.DataFrame, fast: int = 7, slow: int = 21):
-    if df.empty:
+    if df.empty or len(df) < slow:
         return {
             "num_trades": 0,
             "win_rate": 0.0,
@@ -1015,20 +1068,22 @@ def run_sma_backtest(df: pd.DataFrame, fast: int = 7, slow: int = 21):
     df["sma_fast"] = df["close"].rolling(fast).mean()
     df["sma_slow"] = df["close"].rolling(slow).mean()
 
-    df["signal"] = 0
-    df.loc[df["sma_fast"] > df["sma_slow"], "signal"] = 1
-    df["signal_shift"] = df["signal"].shift(1).fillna(0)
+    valid = df["sma_fast"].notna() & df["sma_slow"].notna()
+    df["signal"] = np.where(valid & (df["sma_fast"] > df["sma_slow"]), 1, 0)
+    df["signal_shift"] = df["signal"].shift(1, fill_value=0)
 
     df["ret"] = df["close"].pct_change().fillna(0.0)
-    df["strategy_ret"] = df["ret"] * df["signal_shift"]
+    turnover = df["signal"].diff().abs().fillna(df["signal"].abs())
+    fee_rate = 0.001  # 10 bps per entry/exit leg to penalize churn
+    df["strategy_ret"] = df["ret"] * df["signal_shift"] - turnover * fee_rate
 
     equity = (1.0 + df["strategy_ret"]).cumprod() * 100.0
 
-    entries = df[(df["signal_shift"] == 0) & (df["signal"] == 1)].index
-    exits = df[(df["signal_shift"] == 1) & (df["signal"] == 0)].index
+    entries = df.index[(df["signal_shift"] == 0) & (df["signal"] == 1)]
+    exits = df.index[(df["signal_shift"] == 1) & (df["signal"] == 0)]
 
     if len(entries) > len(exits) and len(entries) > 0:
-        exits = exits.append(pd.Index([df.index[-1]]))
+        exits = exits.union(pd.Index([df.index[-1]]))
 
     trade_returns = []
     signals = []
@@ -1036,7 +1091,7 @@ def run_sma_backtest(df: pd.DataFrame, fast: int = 7, slow: int = 21):
         p_ent = df.loc[ent, "close"]
         p_ex = df.loc[ex, "close"]
         if p_ent and p_ex and p_ent > 0:
-            r = (p_ex / p_ent - 1.0) * 100.0
+            r = ((p_ex / p_ent) - 1.0 - 2 * fee_rate) * 100.0
             trade_returns.append(r)
             signals.append(
                 {
