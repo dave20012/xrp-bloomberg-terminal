@@ -680,10 +680,15 @@ def push(inflows: List[Dict], outflows: List[Dict]):
 
 
 def append_history(flows, max_len: int = 240):
+    ripple_corp_xrp = float(sum(f.get("xrp", 0.0) for f in flows if f.get("ripple_corp")))
+    exchange_xrp = float(sum(f.get("xrp", 0.0) for f in flows if not f.get("ripple_corp")))
+
     snapshot = {
         "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "total_xrp": float(sum(f.get("xrp", 0.0) for f in flows)),
         "weighted_xrp": float(sum(f.get("xrp", 0.0) * f.get("weight", 1.0) for f in flows)),
+        "ripple_corp_xrp": ripple_corp_xrp,
+        "exchange_xrp": exchange_xrp,
     }
 
     try:
