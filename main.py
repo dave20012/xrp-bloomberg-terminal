@@ -32,6 +32,43 @@ from targets import build_target_profile, compute_atr
 # Config / constants
 # =========================
 
+def normalize_env_value(name: str) -> str:
+    """Return a trimmed environment variable (blank string if missing)."""
+
+    raw = (os.getenv(name) or "").strip()
+
+    # Railway variables sometimes get pasted with surrounding quotes.
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {'"', "'"}:
+        raw = raw[1:-1].strip()
+
+    return raw
+
+
+def redact_secret(value: str, keep: int = 4) -> str:
+    """Return a partially redacted secret for safe display."""
+
+    if not value:
+        return "<empty>"
+    if len(value) <= keep * 2:
+        return "*" * len(value)
+    return f"{value[:keep]}***{value[-keep:]}"
+
+
+def validate_binance_credentials(api_key: str, api_secret: str) -> Optional[str]:
+    """Detect common formatting mistakes that lead to Binance auth failures."""
+
+    templated_markers = ("${{", "}}", "BINANCE_API_KEY", "BINANCE_API_SECRET")
+    if any(marker in api_key for marker in templated_markers) or any(
+        marker in api_secret for marker in templated_markers
+    ):
+        return "Binance API credentials look templated; use the raw key/secret without ${{}} wrappers."
+
+    if any(ch.isspace() for ch in api_key) or any(ch.isspace() for ch in api_secret):
+        return "Binance API credentials contain whitespace; copy the raw strings from the Binance dashboard."
+
+    return None
+
+
 st.set_page_config(page_title="XRP Engine v9.3", layout="wide", initial_sidebar_state="collapsed")
 st.title("XRP REVERSAL & BREAKOUT ENGINE v9.3")
 st.markdown(
@@ -179,43 +216,6 @@ def render_health_strip(
             )
         else:
             cols[3].markdown("**Latency**\\n- n/a")
-
-
-def normalize_env_value(name: str) -> str:
-    """Return a trimmed environment variable (blank string if missing)."""
-
-    raw = (os.getenv(name) or "").strip()
-
-    # Railway variables sometimes get pasted with surrounding quotes.
-    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {'"', "'"}:
-        raw = raw[1:-1].strip()
-
-    return raw
-
-
-def redact_secret(value: str, keep: int = 4) -> str:
-    """Return a partially redacted secret for safe display."""
-
-    if not value:
-        return "<empty>"
-    if len(value) <= keep * 2:
-        return "*" * len(value)
-    return f"{value[:keep]}***{value[-keep:]}"
-
-
-def validate_binance_credentials(api_key: str, api_secret: str) -> Optional[str]:
-    """Detect common formatting mistakes that lead to Binance auth failures."""
-
-    templated_markers = ("${{", "}}", "BINANCE_API_KEY", "BINANCE_API_SECRET")
-    if any(marker in api_key for marker in templated_markers) or any(
-        marker in api_secret for marker in templated_markers
-    ):
-        return "Binance API credentials look templated; use the raw key/secret without ${{}} wrappers."
-
-    if any(ch.isspace() for ch in api_key) or any(ch.isspace() for ch in api_secret):
-        return "Binance API credentials contain whitespace; copy the raw strings from the Binance dashboard."
-
-    return None
 
 
 def cache_set_json(key: str, obj: Any) -> None:
