@@ -30,6 +30,12 @@ if not REDIS_URL:
     logger.warning("REDIS_URL not set; using in-memory cache (data not persisted).")
     rdb = _InMemoryRedis()
 else:
-    rdb = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        candidate = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+        candidate.ping()
+        rdb = candidate
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Redis unreachable (%s); using in-memory cache instead.", exc)
+        rdb = _InMemoryRedis()
 
 __all__ = ["rdb"]
