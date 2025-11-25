@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -76,6 +77,59 @@ def compute_sentiment_components(articles: List[Dict[str, Any]], mode: str) -> T
     bear = sum(n * w for n, w in zip(neg_arr, weights)) / weight_sum
     inst = sum(s * w for s, w in zip(scalar_arr, weights)) / weight_sum
     return float(inst), float(bull), float(bear)
+
+
+def _normalize_title_for_conflict(title: Any) -> str:
+    if not isinstance(title, str):
+        return ""
+    return re.sub(r"\s+", " ", title).strip().lower()
+
+
+def resolve_sentiment_conflicts(
+    pos_candidates: List[Dict[str, Any]], neg_candidates: List[Dict[str, Any]]
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Drop duplicate headlines across positive/negative buckets based on source weight.
+
+    When the same normalized title appears in both buckets, the higher-weight version wins;
+    ties are resolved in favor of the positive group to avoid amplifying republished fear.
+    Headlines without titles are left untouched.
+    """
+
+    winners: Dict[str, Dict[str, Any]] = {}
+
+    def _weight(article: Dict[str, Any]) -> float:
+        w = article.get("weight", 0.0)
+        try:
+            return float(w)
+        except Exception:  # noqa: BLE001
+            return 0.0
+
+    for side, bucket in ("pos", pos_candidates), ("neg", neg_candidates):
+        for art in bucket:
+            norm = _normalize_title_for_conflict(art.get("title", ""))
+            if not norm:
+                continue
+            weight = _weight(art)
+            current = winners.get(norm)
+            if current is None or weight > current["weight"] or (
+                weight == current["weight"] and side == "pos"
+            ):
+                winners[norm] = {"side": side, "weight": weight}
+
+    filtered_pos: List[Dict[str, Any]] = []
+    filtered_neg: List[Dict[str, Any]] = []
+
+    for art in pos_candidates:
+        norm = _normalize_title_for_conflict(art.get("title", ""))
+        if not norm or winners.get(norm, {}).get("side") == "pos":
+            filtered_pos.append(art)
+
+    for art in neg_candidates:
+        norm = _normalize_title_for_conflict(art.get("title", ""))
+        if not norm or winners.get(norm, {}).get("side") == "neg":
+            filtered_neg.append(art)
+
+    return filtered_pos, filtered_neg
 
 
 def _parse_inflow_timestamp(value: Any) -> Optional[datetime]:

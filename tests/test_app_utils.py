@@ -57,6 +57,38 @@ class SentimentComponentTests(unittest.TestCase):
         self.assertEqual((inst, bull, bear), (0.0, 0.0, 0.0))
 
 
+class SentimentConflictResolutionTests(unittest.TestCase):
+    def test_positive_wins_against_lower_weight_negative(self):
+        pos = [
+            {"title": "Ripple scores ETF approval", "weight": 0.65, "scalar": 0.7},
+        ]
+        neg = [
+            {"title": "Ripple scores ETF approval", "weight": 0.35, "scalar": -0.2},
+            {"title": "Other bearish headline", "weight": 0.35, "scalar": -0.5},
+        ]
+
+        kept_pos, kept_neg = app_utils.resolve_sentiment_conflicts(pos, neg)
+
+        self.assertEqual(len(kept_pos), 1)
+        self.assertEqual(kept_pos[0]["title"], "Ripple scores ETF approval")
+        self.assertEqual(len(kept_neg), 1)
+        self.assertEqual(kept_neg[0]["title"], "Other bearish headline")
+
+    def test_negative_wins_when_higher_weight(self):
+        pos = [
+            {"title": "Market jitters ahead", "weight": 0.35, "scalar": 0.2},
+        ]
+        neg = [
+            {"title": "Market jitters ahead", "weight": 0.65, "scalar": -0.6},
+        ]
+
+        kept_pos, kept_neg = app_utils.resolve_sentiment_conflicts(pos, neg)
+
+        self.assertEqual(len(kept_pos), 0)
+        self.assertEqual(len(kept_neg), 1)
+        self.assertEqual(kept_neg[0]["title"], "Market jitters ahead")
+
+
 class DataHealthTests(unittest.TestCase):
     def test_describe_data_health_notes_redis(self):
         live = {"price": None, "oi_usd": None, "funding_hist_pct": [], "xrpl_weighted_inflow": 0}
