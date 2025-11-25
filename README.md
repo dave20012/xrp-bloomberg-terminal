@@ -2,6 +2,19 @@
 
 Streamlit dashboard with supporting workers that surface XRP price action, XRPL inflows, Binance positioning, and FinBERT news sentiment. Data is cached in Redis so the web app and workers can share signals.
 
+## Signal scoring overview
+- **Headline sentiment** – FinBERT scores (`pos`, `neg`, `scalar`) are weighted by per-source reliability. “Institutional Only” mode keeps weights ≥ 0.6. Bullish/bearish intensities are instantaneous weighted averages (no 3-day rollups). The sentiment EMA (α = 0.3 by default) is the only smoothed series.
+- **Composite score (0–100)** – The live “NEUTRAL/WATCH/ALERT” label comes from weighted sub-scores:
+  - Funding z-score: up to 22 pts via a capped tanh.
+  - Whale flow (weighted XRPL inflow): up to 14 pts, scaled against 60M XRP.
+  - Price window: up to 28 pts when price is under $2.45, linearly decaying to $3.00.
+  - Open interest: up to 16 pts when OI ≥ $2.7B, decaying to $1.5B.
+  - Binance netflow: up to 30 pts, scaled against 100M XRP equivalent.
+  - Short-squeeze setup: up to 20 pts when L/S ratio ≤ 1.0, decaying to 2.0.
+  - News sentiment EMA: up to 15 pts when EMA ≥ 0.3, decaying to 0.05.
+  - Flippening flow: up to 15 pts when BTC/ETH ratio uplift is positive **and** weighted inflow > 10M XRP.
+- The sub-scores are **not equal-weighted**; they are capped and summed (clamped at 100). See [`docs/dashboard_redesign.md`](docs/dashboard_redesign.md) for improvement ideas and target/stop guidance.
+
 ## Architecture
 - **Web app (`main.py`)** pulls market data from CoinGecko (Binance fallback), funding/oi/netflow from Binance, and reads Redis for XRPL inflows plus sentiment. Plotly renders price/volume charts and SMA backtests.
 - **XRPL inflow worker (`xrpl_inflow_monitor.py`)** fetches on-chain activity from Ripple Data or Whale Alert and writes JSON payloads to Redis (including optional exchange outflows).

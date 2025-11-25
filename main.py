@@ -41,6 +41,29 @@ st.caption(
     f"Dashboard auto-refreshes every {META_REFRESH_SECONDS} seconds; lower values increase API usage."
 )
 
+st.markdown(
+    """
+    <style>
+    .metric-card {
+        padding: 14px 16px;
+        border-radius: 12px;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        background: linear-gradient(135deg, rgba(0, 255, 136, 0.12), rgba(0, 255, 136, 0.02));
+        margin-bottom: 12px;
+    }
+    .metric-title {color: #d0d5dd; font-size: 13px; margin-bottom: 4px;}
+    .metric-value {color: #f8fafc; font-size: 24px; font-weight: 700;}
+    .metric-sub {color: #9ca3af; font-size: 12px; margin-top: 2px;}
+    .section-label {color: #9ca3af; font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase;}
+    .health-pill {padding: 8px 12px; border-radius: 999px; font-size: 12px; display: inline-block; margin-right: 8px;}
+    .health-ok {background: rgba(0, 255, 136, 0.16); color: #a7f3d0; border: 1px solid rgba(34, 197, 94, 0.4);} 
+    .health-warn {background: rgba(234, 179, 8, 0.16); color: #fcd34d; border: 1px solid rgba(234, 179, 8, 0.4);} 
+    .health-err {background: rgba(239, 68, 68, 0.16); color: #fecdd3; border: 1px solid rgba(239, 68, 68, 0.4);} 
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 REQUEST_TIMEOUT = 10
 SENTIMENT_EMA_ALPHA = float(os.getenv("SENTIMENT_EMA_ALPHA", "0.3"))
 RATIO_EMA_ALPHA = float(os.getenv("RATIO_EMA_ALPHA", "0.1"))
@@ -48,6 +71,52 @@ RATIO_EMA_ALPHA = float(os.getenv("RATIO_EMA_ALPHA", "0.1"))
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
+
+
+def metric_card(title: str, value: str, sub: str = "", accent: str = "#00ff88") -> None:
+    """Render a stylized metric card."""
+
+    st.markdown(
+        f"""
+        <div class="metric-card" style="border-left: 4px solid {accent};">
+            <div class="metric-title">{title}</div>
+            <div class="metric-value">{value}</div>
+            <div class="metric-sub">{sub}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def section_label(text: str) -> None:
+    st.markdown(f"<div class='section-label'>{text}</div>", unsafe_allow_html=True)
+
+
+def render_health_strip(issues: List[str], redis_notes: List[str], binance_notes: List[str]) -> None:
+    """Compact health strip showing data and API state."""
+
+    status = "OK" if not issues else "WARN"
+    pill_class = "health-ok" if status == "OK" else "health-warn"
+    with st.container():
+        cols = st.columns([2, 3, 3])
+        cols[0].markdown(
+            f"<span class='health-pill {pill_class}'>System {status}</span>",
+            unsafe_allow_html=True,
+        )
+        if issues:
+            cols[1].markdown(
+                "**Data Issues**\\n" + "\\n".join(f"- {i}" for i in issues)
+            )
+        else:
+            cols[1].markdown("**Data Issues**\\n- None detected")
+
+        combined_notes = (redis_notes or []) + (binance_notes or [])
+        if combined_notes:
+            cols[2].markdown(
+                "**Cache / API Notes**\\n" + "\\n".join(f"- {n}" for n in combined_notes)
+            )
+        else:
+            cols[2].markdown("**Cache / API Notes**\\n- All clear")
 
 
 def normalize_env_value(name: str) -> str:
@@ -284,6 +353,44 @@ def _linear_window_score(value: Optional[float], start: float, end: float, max_s
     ratio = (val - lower) / (upper - lower)
     score = max_score * (1.0 - ratio if start < end else ratio)
     return float(max(0.0, min(max_score, score)))
+
+
+def derive_price_window(
+    price: Optional[float], history: pd.DataFrame
+) -> Tuple[float, float, str]:
+    """Return a dynamic price scoring window anchored to recent market ranges.
+
+    The window adapts to the last 90 days of closes and leaves headroom for
+    breakouts beyond prior highs so scores keep responding as market structure
+    shifts. Falls back to the original static band if no history is available.
+    """
+
+    default_start, default_end = 2.45, 3.0
+
+    if history is None or history.empty:
+        return default_start, default_end, "Price window using static $2.45–$3.00 band (no history)."
+
+    closes = pd.to_numeric(history.get("close"), errors="coerce").dropna()
+    if closes.empty:
+        return default_start, default_end, "Price window using static $2.45–$3.00 band (no clean closes)."
+
+    low = float(closes.min())
+    high = float(closes.max())
+    span = max(high - low, 0.01)
+    q25 = float(closes.quantile(0.25))
+    q65 = float(closes.quantile(0.65))
+
+    # Give full credit when price trades near the lower quartile of the recent
+    # range while allowing the upper bound to expand with volatility and new highs.
+    start = min(max(q25, low + 0.1 * span), q65)
+    headroom = max(span * 0.3, (price or high) * 0.1)
+    end = max(high + headroom, (price or high) * 1.15)
+
+    if end <= start:
+        end = start + max(abs(start) * 0.2, 0.5)
+
+    note = f"Dynamic price window ${start:.2f}–${end:.2f} from 90d range (low ${low:.2f}, high ${high:.2f})."
+    return float(start), float(end), note
 
 
 def _parse_inflow_timestamp(value: Any) -> Optional[datetime]:
@@ -887,18 +994,34 @@ else:
 # Scoring engine
 # =========================
 
+chart_df = get_chart_data()
+price_window_start, price_window_end, price_window_note = derive_price_window(
+    live.get("price"), chart_df
+)
+volume_latest = (
+    float(chart_df["volume"].iloc[-1]) if not chart_df.empty and "volume" in chart_df else None
+)
+volume_percentile = (
+    float(chart_df["volume"].rank(pct=True).iloc[-1] * 100.0)
+    if not chart_df.empty and "volume" in chart_df
+    else 0.0
+)
+
 fund_hist = live.get("funding_hist_pct") or [0.0]
 fund_now = live.get("funding_now_pct") or 0.0
 fund_z = (fund_now - np.mean(fund_hist)) / (
     np.std(fund_hist) if np.std(fund_hist) > 1e-8 else 1e-8
 )
+
 funding_score = _capped_positive_score(fund_z, scale=22.0, cap=22.0)
 
 whale_flow_score = min(
     14.0, max(0.0, (live.get("xrpl_weighted_inflow") or 0.0) / 60e6 * 14.0)
 )
 
-price_score = _linear_window_score(live.get("price"), start=2.45, end=3.0, max_score=28.0)
+price_score = _linear_window_score(
+    live.get("price"), start=price_window_start, end=price_window_end, max_score=28.0
+)
 
 oi_score = _linear_window_score(
     (live.get("oi_usd") or 0.0) / 1e9, start=2.7, end=1.5, max_score=16.0
@@ -916,7 +1039,7 @@ sentiment_score = _linear_window_score(ema_sent, start=0.3, end=0.05, max_score=
 points = {
     "Funding Z-Score": funding_score,
     "Whale Flow (XRPL, weighted)": whale_flow_score,
-    "Price < $2.45": price_score,
+    f"Price window ${price_window_start:.2f}–${price_window_end:.2f}": price_score,
     "OI > $2.7B": oi_score,
     "Binance Netflow Bullish": netflow_score,
     "Short Squeeze Setup": short_squeeze_score,
@@ -930,64 +1053,46 @@ total_score = float(min(100.0, sum(points.values())))
 # =========================
 
 issues, redis_notes = describe_data_health(live, news_payload)
-if issues:
-    st.warning("Data issues: " + ", ".join(issues))
-if redis_notes:
-    st.info("Redis/cache notes:\n- " + "\n- ".join(redis_notes))
-if live.get("binance_notes"):
-    st.info("Binance API notes:\n- " + "\n- ".join(live["binance_notes"]))
+render_health_strip(issues, redis_notes, live.get("binance_notes") or [])
 
 # =========================
-# UI — Metrics
+# UI — Redesigned layout
 # =========================
 
-st.markdown("### Live Metrics")
-c1, c2, c3, c4, c5, c6 = st.columns(6)
-c1.metric(
-    "XRP Price",
-    f"${live.get('price', 0.0):.4f}" if live.get("price") else "—",
-)
-c2.metric("XRP/BTC", f"{btc_ratio:.8f}" if btc_ratio else "—")
-c3.metric("XRP/ETH", f"{eth_ratio:.8f}" if eth_ratio else "—")
-c4.metric("Funding", f"{live.get('funding_now_pct', 0.0):+.4f}%")
-c5.metric("OI (USD)", f"${(live.get('oi_usd') or 0.0)/1e9:.2f}B")
-c6.metric("L/S Ratio", f"{live.get('long_short_ratio', 1.0):.2f}")
+section_label("Market overview")
+o1, o2, o3 = st.columns([1.2, 1, 1])
+with o1:
+    metric_card(
+        "XRP Price",
+        f"${live.get('price', 0.0):.4f}" if live.get("price") else "—",
+        sub=f"Refresh {META_REFRESH_SECONDS}s • Funding {live.get('funding_now_pct', 0.0):+.4f}%",
+    )
+    metric_card("Open Interest", f"${(live.get('oi_usd') or 0.0)/1e9:.2f}B", "Binance futures OI")
+with o2:
+    metric_card("XRP/BTC", f"{btc_ratio:.8f}" if btc_ratio else "—", "vs EMA uplift {btc_uplift_pct:+.2f}%")
+    metric_card("XRP/ETH", f"{eth_ratio:.8f}" if eth_ratio else "—", "vs EMA uplift {eth_uplift_pct:+.2f}%")
+with o3:
+    metric_card("L/S Ratio", f"{live.get('long_short_ratio', 1.0):.2f}", "Short-squeeze setup")
+    metric_card("Binance Netflow (24h)", f"{(live.get('binance_netflow_24h') or 0.0)/1e6:+.1f}M XRP")
+    metric_card(
+        "Spot Volume (24h)",
+        f"${volume_latest/1e6:,.1f}M" if volume_latest else "—",
+        sub=f"{volume_percentile:.0f}th pct vs 90d" if volume_latest else "No volume history",
+    )
 
-st.markdown("### Sentiment & Flow")
-s1, s2, s3, s4, s5, s6 = st.columns(6)
-label = (
-    "Inst. Sentiment EMA" if sent_mode == "Institutional Only" else "News Sentiment EMA"
-)
-s1.metric(label, f"{ema_sent:+.3f}", delta=f"{inst_sent:+.3f} now")
-s2.metric("Bullish Intensity", f"{bull_intensity:+.3f}")
-s3.metric("Bearish Intensity", f"{bear_intensity:+.3f}")
-s4.metric(
-    "XRPL Inflows (raw, M XRP)",
-    f"{(live.get('xrpl_raw_inflow') or 0.0)/1e6:+.1f}",
-)
-s5.metric("XRPL Outflows (raw, M XRP)", f"{(live.get('xrpl_raw_outflow') or 0.0)/1e6:+.1f}")
-s6.metric(
-    "Ripple OTC → Exchanges (M XRP)",
-    f"{(live.get('xrpl_ripple_otc') or 0.0)/1e6:+.1f}",
-)
+section_label("Flows & sentiment")
+f1, f2, f3 = st.columns(3)
+label = "Inst. Sentiment EMA" if sent_mode == "Institutional Only" else "News Sentiment EMA"
+with f1:
+    metric_card(label, f"{ema_sent:+.3f}", sub=f"Bull {bull_intensity:+.3f} • Bear {bear_intensity:+.3f}")
+    metric_card("Ripple OTC → Exchanges", f"{(live.get('xrpl_ripple_otc') or 0.0)/1e6:+.1f}M XRP")
+with f2:
+    metric_card("XRPL Inflows", f"{(live.get('xrpl_raw_inflow') or 0.0)/1e6:+.1f}M raw", sub=f"Weighted {(live.get('xrpl_weighted_inflow') or 0.0)/1e6:+.1f}M")
+    metric_card("XRPL Outflows", f"{(live.get('xrpl_raw_outflow') or 0.0)/1e6:+.1f}M raw", sub=f"Weighted {(live.get('xrpl_weighted_outflow') or 0.0)/1e6:+.1f}M")
+with f3:
+    metric_card("XRPL Netflow", f"{(live.get('xrpl_netflow') or 0.0)/1e6:+.1f}M XRP", sub=f"Flippening score {flip_score:.2f}")
 
-st.metric(
-    "XRPL Inflows (weighted, M XRP)",
-    f"{(live.get('xrpl_weighted_inflow') or 0.0)/1e6:+.1f}",
-)
-st.metric(
-    "XRPL Outflows (weighted, M XRP)",
-    f"{(live.get('xrpl_weighted_outflow') or 0.0)/1e6:+.1f}",
-)
-st.metric("XRPL Netflow (M XRP)", f"{(live.get('xrpl_netflow') or 0.0)/1e6:+.1f}")
-
-st.metric("Flippening Flow Score", f"{flip_score:.2f}")
-st.write(
-    f"XRP/BTC uplift vs EMA baseline: {btc_uplift_pct:+.2f}%  |  "
-    f"XRP/ETH uplift vs EMA baseline: {eth_uplift_pct:+.2f}%"
-)
-
-# Score
+# Score + composition
 score_col, signal_col = st.columns([1, 2])
 with score_col:
     if total_score >= 80:
@@ -1008,48 +1113,51 @@ with signal_col:
         unsafe_allow_html=True,
     )
     st.write(f"Funding Z-Score: {fund_z:+.2f}")
-
-st.write("**Score breakdown**")
-for k, v in points.items():
-    st.write(f"• {k}: {v:.1f}")
+    score_df = (
+        pd.DataFrame({"Component": points.keys(), "Points": points.values()})
+        .sort_values("Points", ascending=False)
+        .reset_index(drop=True)
+    )
+    score_df["Points"] = score_df["Points"].map(lambda x: f"{x:.1f}")
+    st.table(score_df)
+    st.caption(price_window_note)
 
 # =========================
 # Live Signal Breakdown (raw)
 # =========================
 
-st.markdown("**Live Signal Breakdown (raw)**")
-raw_items = {
-    "Funding Now (%)": live.get("funding_now_pct"),
-    "Funding Z-Score": round(fund_z, 4),
-    "XRPL Inflows (raw, M XRP)": (live.get("xrpl_raw_inflow") or 0.0) / 1e6,
-    "XRPL Outflows (raw, M XRP)": (live.get("xrpl_raw_outflow") or 0.0) / 1e6,
-    "XRPL Netflow (raw, M XRP)": (live.get("xrpl_netflow") or 0.0) / 1e6,
-    "XRPL Inflows (weighted, M XRP)": (live.get("xrpl_weighted_inflow") or 0.0)
-    / 1e6,
-    "XRPL Outflows (weighted, M XRP)": (live.get("xrpl_weighted_outflow") or 0.0)
-    / 1e6,
-    "Ripple OTC → Exchanges (M XRP)": (live.get("xrpl_ripple_otc") or 0.0) / 1e6,
-    "Binance Netflow 24h (XRP)": live.get("binance_netflow_24h"),
-    "Open Interest $": live.get("oi_usd") or 0.0,
-    "L/S Ratio": live.get("long_short_ratio"),
-    "News Sentiment (inst)": inst_sent,
-    "News Sentiment EMA": ema_sent,
-    "Bullish Intensity": bull_intensity,
-    "Bearish Intensity": bear_intensity,
-    "News Count": news_payload.get("count", 0),
-    "Flippening Score": flip_score,
-}
-for k, v in raw_items.items():
-    a, b = st.columns([3, 1])
-    a.write(k)
-    b.write("Quiet" if v == 0 else str(v))
+with st.expander("Live Signal Breakdown (raw)", expanded=False):
+    raw_items = {
+        "Funding Now (%)": live.get("funding_now_pct"),
+        "Funding Z-Score": round(fund_z, 4),
+        "XRPL Inflows (raw, M XRP)": (live.get("xrpl_raw_inflow") or 0.0) / 1e6,
+        "XRPL Outflows (raw, M XRP)": (live.get("xrpl_raw_outflow") or 0.0) / 1e6,
+        "XRPL Netflow (raw, M XRP)": (live.get("xrpl_netflow") or 0.0) / 1e6,
+        "XRPL Inflows (weighted, M XRP)": (live.get("xrpl_weighted_inflow") or 0.0)
+        / 1e6,
+        "XRPL Outflows (weighted, M XRP)": (live.get("xrpl_weighted_outflow") or 0.0)
+        / 1e6,
+        "Ripple OTC → Exchanges (M XRP)": (live.get("xrpl_ripple_otc") or 0.0) / 1e6,
+        "Binance Netflow 24h (XRP)": live.get("binance_netflow_24h"),
+        "Open Interest $": live.get("oi_usd") or 0.0,
+        "L/S Ratio": live.get("long_short_ratio"),
+        "News Sentiment (inst)": inst_sent,
+        "News Sentiment EMA": ema_sent,
+        "Bullish Intensity": bull_intensity,
+        "Bearish Intensity": bear_intensity,
+        "News Count": news_payload.get("count", 0),
+        "Flippening Score": flip_score,
+    }
+    for k, v in raw_items.items():
+        a, b = st.columns([3, 1])
+        a.write(k)
+        b.write("Quiet" if v == 0 else str(v))
 
 # =========================
 # Simple SMA Backtest on Price
 # =========================
 
 st.markdown("### 90-Day SMA + Volume Backtest (Price-only Approximation)")
-chart_df = get_chart_data()
 
 
 def run_sma_backtest(df: pd.DataFrame, fast: int = 7, slow: int = 21):
