@@ -73,6 +73,18 @@ SIGNAL_COMPONENTS: Dict[str, SignalComponent] = {
         hint="Only smoothed sentiment input; instantaneous tiles remain unsmoothed.",
         cap_note="15 pts at EMA ≥ 0.30; fades to zero by 0.05.",
     ),
+    # Aggregated open interest across major venues (e.g., Binance + Bybit). The goal
+    # is to reflect liquidity beyond a single exchange. Full credit is given
+    # when aggregated OI surpasses $4B and fades to zero by $2B. This
+    # encourages awareness of cross‑exchange flows and prevents liquidity
+    # blind spots.
+    "oi_aggregated": SignalComponent(
+        name="Aggregated Open Interest Depth",
+        max_points=16.0,
+        description="Rewards aggregated OI ≥ $4B with linear decay to $2B to capture multi‑venue liquidity.",
+        hint="Combines open interest from multiple exchanges; avoids overweighting any single venue.",
+        cap_note="Full 16 pts above $4B; fades to zero by $2B.",
+    ),
     "flippening": SignalComponent(
         name="Flippening Flow",
         max_points=15.0,
