@@ -226,6 +226,32 @@ def compute_signal_stack(
             note=f"${oi_usd:,.0f} open interest vs. $1.5B–$2.7B lane",
         )
 
+    # Aggregated open interest across exchanges (Binance + Bybit). This
+    # component rewards multi‑venue liquidity. Full points are awarded when
+    # aggregated OI exceeds $4B and decays linearly to $2B.
+    agg_oi = futures.get("aggregated_open_interest")
+    agg_meta = SIGNAL_COMPONENTS.get("oi_aggregated")
+    if agg_meta:
+        if agg_oi is None:
+            add_component(
+                "oi_aggregated",
+                points=0.0,
+                available=False,
+                status="Aggregated OI missing",
+                note="Could not fetch aggregated open interest across venues.",
+            )
+        else:
+            agg_scale = _clamp((agg_oi - 2_000_000_000) / (4_000_000_000 - 2_000_000_000))
+            agg_points = agg_meta.max_points * agg_scale
+            status = "Depth supportive" if agg_scale >= 0.6 else "Shallow liquidity"
+            add_component(
+                "oi_aggregated",
+                points=agg_points,
+                available=True,
+                status=status,
+                note=f"${agg_oi:,.0f} aggregated OI",
+            )
+
     inflow = flows.get("latest_inflow")
     flow_meta = SIGNAL_COMPONENTS.get("whale_flow")
     if inflow is None:
@@ -298,12 +324,17 @@ def compute_signal_stack(
     ls_ratio = futures.get("long_short_ratio")
     squeeze_meta = SIGNAL_COMPONENTS.get("squeeze")
     if ls_ratio is None:
+        # When the long/short ratio cannot be fetched (e.g. due to network errors),
+        # treat the squeeze setup as neutral rather than punitive. Assign half of
+        # the component’s maximum points and mark the input as unavailable.
+        default_scale = 0.5
+        squeeze_points = squeeze_meta.max_points * default_scale if squeeze_meta else 0.0
         add_component(
             "squeeze",
-            points=0.0,
+            points=squeeze_points,
             available=False,
-            status="L/S ratio unavailable",
-            note="Long/short data not fetched or API error.",
+            status="Neutral (L/S ratio unavailable)",
+            note="Default neutral weight applied due to missing long/short ratio.",
         )
     else:
         # Linearly scale between 1.0 and 2.0: full points at ≤1.0, zero at ≥2.0.
@@ -340,6 +371,7 @@ def compute_signal_stack(
 
 COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 BINANCE_FAPI = "https://fapi.binance.com"
+BYBIT_API = "https://api.bybit.com"
 REQUEST_TIMEOUT = 12
 
 def fetch_long_short_ratio(period: str = "1h") -> Optional[float]:
@@ -383,6 +415,162 @@ def fetch_long_short_ratio(period: str = "1h") -> Optional[float]:
         # Ignore transient errors; caller will handle missing data gracefully
         return None
     return None
+
+# ============================================================================
+# Additional data providers
+#
+# The Binance endpoints occasionally return "unknown" or fail due to rate
+# limits. To enhance resilience, we integrate Bybit's public V5 endpoints for
+# both open interest and the long/short account ratio. These endpoints are
+# publicly documented and do not require authentication. According to the
+# Bybit API documentation, the account‑ratio endpoint returns buyRatio and
+# sellRatio fields, representing the ratio of accounts holding long and short
+# positions respectively【467619510942920†L95-L104】. The open interest endpoint
+# returns the total open interest per symbol measured in the base asset【208719992864950†L94-L128】.
+
+def fetch_bybit_long_short_ratio(period: str = "1h") -> Optional[float]:
+    """
+    Fetch the long/short account ratio for XRPUSDT from Bybit.
+
+    This function queries the V5 market account ratio endpoint. It requests
+    linear USDT‑margined perpetual data for a one‑hour window (by default). If
+    the API responds successfully, the ratio is computed as buyRatio / sellRatio.
+    On any error or missing fields the function returns None.
+
+    Parameters
+    ----------
+    period: str
+        The time interval for the ratio; valid values include "5min",
+        "15min", "30min", "1h", "4h", and "1d"【467619510942920†L110-L115】.
+
+    Returns
+    -------
+    Optional[float]
+        The numeric long/short ratio, or None if unavailable.
+    """
+    try:
+        url = f"{BYBIT_API}/v5/market/account-ratio"
+        params = {
+            "category": "linear",
+            "symbol": "XRPUSDT",
+            "period": period,
+            "limit": 1,
+        }
+        resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        if not resp.ok:
+            return None
+        data = resp.json() or {}
+        result = data.get("result", {})
+        lst = result.get("list", [])
+        if lst:
+            entry = lst[0] or {}
+            try:
+                buy_ratio = float(entry.get("buyRatio", 0))
+                sell_ratio = float(entry.get("sellRatio", 0))
+                if sell_ratio > 0:
+                    return buy_ratio / sell_ratio
+            except Exception:
+                return None
+    except Exception:
+        return None
+    return None
+
+
+def fetch_bybit_open_interest(period: str = "1h") -> Optional[float]:
+    """
+    Fetch open interest for XRPUSDT from Bybit's V5 market endpoint.
+
+    The endpoint returns open interest measured in the base asset for linear
+    contracts. This function retrieves the most recent data point (limit=1)
+    for the given interval and converts the value to float. If the endpoint
+    fails or returns invalid data, None is returned.
+
+    Parameters
+    ----------
+    period: str
+        The interval time; valid values include "5min", "15min", "30min",
+        "1h", "4h", and "1d"【208719992864950†L110-L117】.
+
+    Returns
+    -------
+    Optional[float]
+        The open interest in base asset units (XRP), or None on error.
+    """
+    try:
+        url = f"{BYBIT_API}/v5/market/open-interest"
+        params = {
+            "category": "linear",
+            "symbol": "XRPUSDT",
+            "intervalTime": period,
+            "limit": 1,
+        }
+        resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        if not resp.ok:
+            return None
+        data = resp.json() or {}
+        result = data.get("result", {})
+        lst = result.get("list", [])
+        if lst:
+            entry = lst[0] or {}
+            oi_str = entry.get("openInterest")
+            try:
+                return float(oi_str) if oi_str is not None else None
+            except Exception:
+                return None
+    except Exception:
+        return None
+    return None
+
+
+def fetch_aggregated_open_interest(period: str = "1h") -> Optional[float]:
+    """
+    Aggregate open interest across Binance and Bybit and convert to USD.
+
+    This helper attempts to pull open interest from Binance's openInterest
+    endpoint (USDⓈ‑M contracts) and from Bybit's open‑interest endpoint for
+    linear contracts. It then multiplies each base‑asset value by the latest
+    XRP/USD price fetched via CoinGecko. If both venues return data the
+    results are summed; if only one succeeds that value is returned. Returns
+    None if neither API returns valid data.
+
+    Parameters
+    ----------
+    period: str
+        Interval parameter passed to the Bybit request. Binance's endpoint
+        returns a snapshot and ignores this value.
+
+    Returns
+    -------
+    Optional[float]
+        The aggregated open interest in USD, or None when unavailable.
+    """
+    price_data = fetch_price_snapshot()
+    price_usd = price_data.get("price")
+    total_usd: float = 0.0
+
+    # Binance open interest (base asset). Convert to USD.
+    try:
+        resp = requests.get(
+            f"{BINANCE_FAPI}/fapi/v1/openInterest", params={"symbol": "XRPUSDT"}, timeout=REQUEST_TIMEOUT
+        )
+        if resp.ok:
+            payload = resp.json() or {}
+            oi_str = payload.get("openInterest")
+            if oi_str is not None and price_usd:
+                total_usd += float(oi_str) * float(price_usd)
+    except Exception:
+        pass
+
+    # Bybit open interest (base asset). Convert to USD.
+    bybit_oi = None
+    try:
+        bybit_oi = fetch_bybit_open_interest(period)
+    except Exception:
+        bybit_oi = None
+    if bybit_oi is not None and price_usd:
+        total_usd += bybit_oi * float(price_usd)
+
+    return total_usd if total_usd > 0 else None
 
 
 def load_api_credentials() -> Dict[str, str]:
@@ -544,19 +732,32 @@ def fetch_funding_and_oi() -> Dict[str, Optional[float]]:
         except Exception:  # noqa: BLE001
             oi = None
 
-    # Attempt to fetch the long/short ratio for XRP perpetual futures. This signal
-    # captures the balance between long and short positions on Binance. When the
-    # longShortRatio is ≤1.0, shorts dominate longs which can set up a potential
-    # short squeeze; ratios above 2.0 indicate longs heavily outweigh shorts.
+    # Attempt to fetch the long/short ratio for XRP perpetual futures. We first
+    # query Binance; if this fails we fall back to Bybit’s account‑ratio endpoint.
     ls_ratio = None
     try:
         ls_ratio = fetch_long_short_ratio()
     except Exception:
         ls_ratio = None
+    if ls_ratio is None:
+        try:
+            ls_ratio = fetch_bybit_long_short_ratio()
+        except Exception:
+            ls_ratio = None
+
+    # Aggregate open interest across exchanges. If both Binance and Bybit
+    # endpoints fail the aggregated value will be None.
+    aggregated_oi: Optional[float] = None
+    try:
+        aggregated_oi = fetch_aggregated_open_interest()
+    except Exception:
+        aggregated_oi = None
+
     return {
         "funding": funding,
         "open_interest": oi,
         "long_short_ratio": ls_ratio,
+        "aggregated_open_interest": aggregated_oi,
     }
 
 
@@ -807,8 +1008,13 @@ def render_liquidity_panel(futures: Dict[str, Optional[float]], flows: Dict[str,
         styled_metric("Funding", f"{funding:+.4f}%" if funding is not None else "–", note)
 
     with col2:
+        # Prefer aggregated open interest if available; fall back to the
+        # Binance-only snapshot. Display a contextually appropriate note.
+        agg_oi = futures.get("aggregated_open_interest")
         oi = futures.get("open_interest")
-        styled_metric("Open Interest", f"${oi:,.0f}" if oi else "–", "Binance USDⓈ-M")
+        value = agg_oi if agg_oi is not None else oi
+        note = "Aggregated across major venues" if agg_oi is not None else "Binance USDⓈ-M"
+        styled_metric("Open Interest", f"${value:,.0f}" if value else "–", note)
 
     with col3:
         inflow = flows.get("latest_inflow") or 0.0
