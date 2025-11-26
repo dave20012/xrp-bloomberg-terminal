@@ -293,6 +293,31 @@ def compute_signal_stack(
             note=f"EMA {sentiment_ema:+.2f} vs. +0.05/+0.30 lane",
         )
 
+    # Long/short ratio based squeeze component. A value ≤1.0 implies more shorts
+    # than longs, favouring a short‑squeeze setup; values ≥2.0 imply longs dominate.
+    ls_ratio = futures.get("long_short_ratio")
+    squeeze_meta = SIGNAL_COMPONENTS.get("squeeze")
+    if ls_ratio is None:
+        add_component(
+            "squeeze",
+            points=0.0,
+            available=False,
+            status="L/S ratio unavailable",
+            note="Long/short data not fetched or API error.",
+        )
+    else:
+        # Linearly scale between 1.0 and 2.0: full points at ≤1.0, zero at ≥2.0.
+        ls_scale = _clamp((2.0 - ls_ratio) / (2.0 - 1.0))
+        squeeze_points = squeeze_meta.max_points * ls_scale
+        status = "Short squeeze risk" if ls_ratio <= 1.0 else "Long‑skewed"
+        add_component(
+            "squeeze",
+            points=squeeze_points,
+            available=True,
+            status=status,
+            note=f"L/S ratio {ls_ratio:.2f}",
+        )
+
     total_points = sum(d["points"] for d in details if d["available"])
     total_cap = sum(d["max_points"] for d in details if d["available"])
     normalized = (total_points / total_cap * 100.0) if total_cap else 0.0
@@ -316,6 +341,48 @@ def compute_signal_stack(
 COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 BINANCE_FAPI = "https://fapi.binance.com"
 REQUEST_TIMEOUT = 12
+
+def fetch_long_short_ratio(period: str = "1h") -> Optional[float]:
+    """
+    Fetch the global long/short account ratio for XRP futures from Binance.
+
+    Binance exposes a public endpoint for the long/short ratio of each symbol.
+    The API is queried without authentication and returns the most recent
+    longShortRatio when no start/end timestamps are provided. This signal
+    highlights potential short‑squeeze setups: values ≤1.0 indicate that
+    shorts dominate long positions.  According to Binance documentation, the
+    endpoint accepts the trading pair and a period parameter, and if
+    startTime/endTime are omitted the latest data is returned【611834218709811†L84-L110】.
+
+    Parameters
+    ----------
+    period: str
+        The time interval for the ratio; valid values include "5m", "15m",
+        "30m", "1h", "2h", "4h", "6h", "12h", and "1d"【611834218709811†L100-L104】.
+
+    Returns
+    -------
+    Optional[float]
+        The numeric long/short ratio, or None if unavailable or on error.
+    """
+    try:
+        url = f"{BINANCE_FAPI}/futures/data/globalLongShortAccountRatio"
+        params = {"pair": "XRPUSDT", "period": period, "limit": 1}
+        resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        if resp.ok:
+            payload = resp.json()
+            if isinstance(payload, list) and payload:
+                record = payload[0]
+                ratio_str = record.get("longShortRatio")
+                if ratio_str is not None:
+                    try:
+                        return float(ratio_str)
+                    except Exception:
+                        return None
+    except Exception:
+        # Ignore transient errors; caller will handle missing data gracefully
+        return None
+    return None
 
 
 def load_api_credentials() -> Dict[str, str]:
@@ -477,7 +544,20 @@ def fetch_funding_and_oi() -> Dict[str, Optional[float]]:
         except Exception:  # noqa: BLE001
             oi = None
 
-    return {"funding": funding, "open_interest": oi}
+    # Attempt to fetch the long/short ratio for XRP perpetual futures. This signal
+    # captures the balance between long and short positions on Binance. When the
+    # longShortRatio is ≤1.0, shorts dominate longs which can set up a potential
+    # short squeeze; ratios above 2.0 indicate longs heavily outweigh shorts.
+    ls_ratio = None
+    try:
+        ls_ratio = fetch_long_short_ratio()
+    except Exception:
+        ls_ratio = None
+    return {
+        "funding": funding,
+        "open_interest": oi,
+        "long_short_ratio": ls_ratio,
+    }
 
 
 def fetch_xrpl_flows() -> Dict[str, Any]:
