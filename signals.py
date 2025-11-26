@@ -85,6 +85,45 @@ SIGNAL_COMPONENTS: Dict[str, SignalComponent] = {
         hint="Combines open interest from multiple exchanges; avoids overweighting any single venue.",
         cap_note="Full 16 pts above $4B; fades to zero by $2B.",
     ),
+
+    # Change in open interest relative to the previous snapshot. Positive OI
+    # changes when price rises signal leveraged conviction; negative changes
+    # during price falls can indicate capitulation or deleveraging. Full points
+    # accrue when the absolute delta exceeds $200M in either direction, with
+    # linear scaling to $0 at 0. A separate divergence component will account
+    # for directional disagreement between OI and price.
+    "oi_change": SignalComponent(
+        name="OI Change",
+        max_points=12.0,
+        description="Rewards absolute changes in aggregated open interest beyond $0.2B; penalises stagnation.",
+        hint="Measures the magnitude of leverage entering or exiting the market.",
+        cap_note="Full 12 pts at ±$0.2B change; zero at no change.",
+    ),
+
+    # Relative volume (rVOL) gauges whether the current trading volume materially
+    # exceeds its recent average. It’s computed as current volume divided by
+    # the moving average of the last N periods. Full points are awarded when
+    # rVOL ≥ 3.0 and fade to zero by 1.0.
+    "relative_volume": SignalComponent(
+        name="Relative Volume",
+        max_points=10.0,
+        description="Rewards high trading activity when current volume is ≥3× its moving average.",
+        hint="Helps identify breakouts backed by volume rather than idle markets.",
+        cap_note="Full 10 pts at rVOL ≥ 3.0; zero by 1.0.",
+    ),
+
+    # Divergence between price and open interest signals when sentiment and
+    # positioning are misaligned. Bullish divergence occurs when OI rises while
+    # price falls; bearish divergence occurs when OI falls while price rises.
+    # This component awards points when such divergences are detected and
+    # decays to zero otherwise.
+    "divergence": SignalComponent(
+        name="OI‑Price Divergence",
+        max_points=8.0,
+        description="Flags misalignment between price and aggregated OI direction (bearish/bullish divergences).",
+        hint="Bullish divergence: OI ↑, price ↓; bearish divergence: OI ↓, price ↑.",
+        cap_note="8 pts awarded per detected divergence; zero otherwise.",
+    ),
     "flippening": SignalComponent(
         name="Flippening Flow",
         max_points=15.0,
