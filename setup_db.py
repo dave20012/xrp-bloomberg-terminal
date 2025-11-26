@@ -3,10 +3,11 @@
 setup_db.py
 
 Creates required tables and indexes for the XRP Quant Console
-on Railway PostgreSQL using the `DATABASE_URL` environment variable.
+on Railway PostgreSQL using the correct DB URL.
 
-Run:
-    python setup_db.py
+Automatically prefers DATABASE_PUBLIC_URL when available
+(used for local connections). Falls back to private DATABASE_URL
+when running inside Railway.
 
 Requires:
     pip install psycopg2-binary python-dotenv
@@ -15,7 +16,24 @@ Requires:
 import os
 import sys
 import psycopg2
-from urllib.parse import urlparse
+
+def get_correct_db_url():
+    """
+    Prefer DATABASE_PUBLIC_URL (hosted Postgres reachable from local)
+    Fall back to internal DATABASE_URL when running inside Railway.
+    """
+    public = os.getenv("DATABASE_PUBLIC_URL")
+    private = os.getenv("DATABASE_URL")
+
+    # Prefer the public one when local script is executed
+    if public and "trolley.proxy" in public:
+        return public
+
+    # Fall back for workers inside Railway container
+    if private:
+        return private
+
+    return None
 
 
 SQL = """
@@ -52,11 +70,13 @@ CREATE INDEX IF NOT EXISTS idx_flows_time ON xrpl_flows (timestamp DESC);
 
 
 def main():
-    url = os.getenv("DATABASE_URL")
+    url = get_correct_db_url()
 
     if not url:
-        print("❌ ERROR: DATABASE_URL environment variable not found.")
-        print("➡ Set it in Railway (using `${{ Postgres.DATABASE_URL }}`), then try again.")
+        print("❌ ERROR: No valid database URL found.")
+        print("➡ Ensure Railway environment has:")
+        print("   DATABASE_URL=${{ Postgres.DATABASE_URL }}")
+        print("   DATABASE_PUBLIC_URL=<auto copy from connect tab>")
         sys.exit(1)
 
     print(f"📡 Connecting to PostgreSQL...")
@@ -78,11 +98,11 @@ def main():
         conn.rollback()
         sys.exit(1)
 
-    print("✅ Database setup complete!")
-    print("🎉 You can now:")
-    print("   • Run `worker.py` to ingest live data")
-    print("   • Run `import_backfill.py` to seed historical data")
-    print("   • Run `store_backtest_results.py` to archive strategy results")
+    print("🎉 Database setup complete!")
+    print("▶ You can now run:")
+    print("   💠 `import_backfill.py`  — seed historical market, OI & flows")
+    print("   ⚡ `worker.py`          — start live ingestion loop")
+    print("   📚 `store_backtest_results.py` — archive strategy signals")
     conn.close()
 
 
