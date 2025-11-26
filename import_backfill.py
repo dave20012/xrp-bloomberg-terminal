@@ -1,68 +1,58 @@
 #!/usr/bin/env python3
 """
 import_backfill.py
-Fully automatic historical data import (worker mode).
+Historical backfill for XRP Quant Console.
 """
 
 import os
-import sys
-import time
 import logging
-import pandas as pd
 import psycopg2
-from datetime import datetime, timedelta
+import pandas as pd
 
-# Correct modules for your repo:
-from data_fetch import fetch_historical_market  # <-- UPDATED
-from xrpl_flow import fetch_historical_flows    # <-- UPDATED
+from fetch_history import fetch_historical_market
+from xrpl_inflow_monitor import fetch_historical_flows
 
 # ---------- Logging ----------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(levelname)s:%(message)s"
+    format="%(levelname)s: %(message)s"
 )
 
-# ---------- DB URL Selection ----------
+# ---------- DB URL Selector ----------
 def get_db_url():
+    # Prefer public proxy for local runs
     public = os.getenv("DATABASE_PUBLIC_URL")
     private = os.getenv("DATABASE_URL")
-    # Prefer public (proxy) when running locally
+
     if public and "proxy" in public:
         return public
     return private or public
 
-# ---------- Runtime Bounds ----------
-def get_days():
-    try:
-        return int(os.getenv("BACKFILL_DAYS", "180"))
-    except:
-        return 180
-
-# ---------- DB Write Helper ----------
-def db_write(table: str, df: pd.DataFrame, conflict_key="timestamp"):
+# ---------- Write Helper ----------
+def insert_dataframe(table: str, df: pd.DataFrame, conflict_key="timestamp"):
     if df.empty:
-        logging.warning(f"⚠ No data to insert into table: {table}")
+        logging.warning(f"⚠ No data fetched for table: {table}")
         return
 
     url = get_db_url()
     if not url:
-        raise ValueError("No DB URL found in environment.")
+        raise ValueError("💥 No DATABASE_URL / DATABASE_PUBLIC_URL found.")
 
     conn = psycopg2.connect(url, sslmode="require")
     cur = conn.cursor()
 
     for _, row in df.iterrows():
+        cols = ",".join(df.columns)
         placeholders = ",".join(["%s"] * len(row))
         sql = f"""
-            INSERT INTO {table} ({','.join(df.columns)})
+            INSERT INTO {table} ({cols})
             VALUES ({placeholders})
             ON CONFLICT ({conflict_key}) DO NOTHING;
         """
         try:
             cur.execute(sql, tuple(row))
         except Exception as e:
-            logging.error(f"Insert fail on {table}: {e}")
-            continue
+            logging.error(f"💥 Insert failed [{table}]: {e}")
 
     conn.commit()
     cur.close()
@@ -70,29 +60,28 @@ def db_write(table: str, df: pd.DataFrame, conflict_key="timestamp"):
 
 # ---------- MAIN ----------
 def main():
-    days = get_days()
-    logging.info(f"📥 Starting backfill for {days} days...")
+    days = int(os.getenv("BACKFILL_DAYS", "180"))
+    logging.info(f"📥 Backfilling {days} days of data ..")
 
-    # 1) Market + OI + Funding
+    # 1) Market Data
     try:
-        logging.info("📊 Fetching historical market data...")
+        logging.info("📊 Fetching market history (price, funding, OI)..")
         mk = fetch_historical_market(days)
-        db_write("signals_snapshot", mk)
-        logging.info("✔ Market backfill complete.")
+        insert_dataframe("signals_snapshot", mk)
+        logging.info("✔ Market history imported.")
     except Exception as e:
-        logging.error(f"Market backfill fail: {e}")
+        logging.error(f"❌ Market backfill error: {e}")
 
     # 2) XRPL Flows
     try:
-        logging.info("🌊 Importing historical XRPL flows...")
+        logging.info("🌊 Fetching XRPL inflow/outflow history..")
         flows = fetch_historical_flows(days)
-        db_write("xrpl_flows", flows, conflict_key="ledger_index")
-        logging.info("✔ XRPL flow backfill complete.")
+        insert_dataframe("xrpl_flows", flows, conflict_key="ledger_index")
+        logging.info("✔ XRPL flows imported.")
     except Exception as e:
-        logging.error(f"XRPL flow backfill fail: {e}")
+        logging.error(f"❌ XRPL flow backfill error: {e}")
 
-    logging.info("🎉 Backfill fully done!")
-    print("🎉 Backfill fully done!")
+    logging.info("🎉 FULL BACKFILL COMPLETE")
 
 if __name__ == "__main__":
     main()
