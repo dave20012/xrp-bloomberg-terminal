@@ -533,6 +533,12 @@ def fetch_xrpl_flows() -> Dict[str, Any]:
             inflow_meta.setdefault("provider", provider or "unknown")
             inflow_meta.setdefault("count", len(inflows))
             inflow_meta.setdefault("run_seconds", 0)
+    # Normalize timestamp for dashboard compatibility: copy updated_at to timestamp
+    if isinstance(inflow_meta, dict):
+        # If inflow_meta stores 'updated_at' but not 'timestamp', promote it. Downstream
+        # consumers like the Streamlit dashboard expect a 'timestamp' key.
+        if inflow_meta.get("updated_at") and not inflow_meta.get("timestamp"):
+            inflow_meta["timestamp"] = inflow_meta.get("updated_at")
 
     return {
         "latest_inflow": _total_amount(inflows),
@@ -630,10 +636,18 @@ def render_market_header(price: Dict[str, Optional[float]], flows: Dict[str, Any
         styled_metric("Exchanges → XRPL", f"{outflow:,.0f} XRP", "Last observed slice")
 
     with col4:
-        meta = flows.get("meta", {})
-        source = meta.get("provider", "unknown")
-        ts = to_datetime(meta.get("timestamp"))
-        styled_metric("Flow heartbeat", source.title(), f"{time_ago(ts)} via {source}")
+        meta = flows.get("meta", {}) or {}
+        # Prefer a 'timestamp' field when available, but fall back to the legacy
+        # 'updated_at' key written by the inflow worker. Without this fallback
+        # the flow heartbeat shows "unknown" even when inflow snapshots are fresh.
+        source = meta.get("provider", "unknown") or "unknown"
+        ts_raw = meta.get("timestamp") or meta.get("updated_at")
+        ts = to_datetime(ts_raw)
+        styled_metric(
+            "Flow heartbeat",
+            source.title(),
+            f"{time_ago(ts)} via {source}"
+        )
 
 
 def render_signal_panel(stack: Dict[str, Any]) -> None:
