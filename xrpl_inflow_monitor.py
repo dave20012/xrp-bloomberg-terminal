@@ -813,3 +813,29 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# -----------------------------------------------------------------------------
+# Historical backfill API
+# -----------------------------------------------------------------------------
+def fetch_historical_flows(days: int):
+    """Return an empty DataFrame with XRPL flow columns for backfill.
+
+    The XRP ledger public APIs used by this project focus on near real‑time
+    transaction scraping and do not expose a cost‑effective full history
+    endpoint.  Attempting to backfill large volumes of transactions via
+    `account_tx` or Ripple Data will quickly exceed rate limits and is
+    unsuitable for the free tier.  To allow the dashboard to initialise
+    without XRPL flow data, this helper returns an empty pandas DataFrame
+    with the expected schema when called from the backfill script.  Live
+    inflows/outflows will still be captured by the XRPL monitor in
+    production.
+
+    Args:
+        days: Number of days of history requested (unused).
+
+    Returns:
+        A pandas DataFrame with columns ["timestamp", "inflow_xrp",
+        "outflow_xrp", "netflow_xrp"].
+    """
+    import pandas as _pd
+    return _pd.DataFrame(columns=["timestamp", "inflow_xrp", "outflow_xrp", "netflow_xrp"])
