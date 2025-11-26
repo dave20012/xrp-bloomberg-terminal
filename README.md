@@ -47,11 +47,36 @@ Streamlit dashboard with supporting workers that surface XRP price action, XRPL 
    ```bash
    streamlit run main.py
    ```
-5. Run workers locally when you want live inflows/sentiment:
+5. Run workers locally when you want live inflows/sentiment and to persist
+   data into PostgreSQL:
    ```bash
+   # In one terminal: XRPL inflow monitor (writes to Redis and can also feed DB via the web app)
    REDIS_URL=redis://localhost:6379 python xrpl_inflow_monitor.py
+
+   # In another terminal: sentiment worker (writes sentiment to Redis)
    REDIS_URL=redis://localhost:6379 python sentiment_worker.py
+
+   # In a third terminal: data ingestion worker (writes snapshots and flows to Timescale/PostgreSQL)
+   PG_HOST=localhost PG_PORT=5432 PG_USER=... PG_PASSWORD=... PG_DB=... python worker.py --once
    ```
+
+   The `worker.py` script inserts a consolidated snapshot of price, open
+   interest, funding, long/short ratio, relative volume and on‑chain
+   flows into TimescaleDB every 5 minutes (when run without `--once`).
+
+6. Optional: backfill historical data into the database using a CSV.
+   Prepare a CSV with columns `timestamp`, `price_close`, `volume`,
+   `aggregated_oi_usd`, `funding_rate` and `long_short_ratio`.  Then run:
+   ```bash
+   python import_backfill.py --csv path/to/your_data.csv
+   ```
+
+7. Optional: run a simple backtest on the stored composite scores:
+   ```bash
+   python backtest.py --start 2025-01-01 --end 2025-06-01 --entry 65 --exit 35
+   ```
+   Adjust `--entry` and `--exit` to reflect your risk tolerance.  The
+   script prints both the strategy and buy‑and‑hold cumulative returns.
 
 ## Deployment (Railway)
 1. Push this repo to your Git provider and connect it to Railway (or push directly via Railway CLI).
@@ -71,14 +96,22 @@ Streamlit dashboard with supporting workers that surface XRP price action, XRPL 
    - `META_REFRESH_SECONDS` (optional, default 45)
    - `XRPL_POLL_SECONDS` (optional, default 30; `XRPL_INFLOWS_INTERVAL` still supported for backwards compatibility)
    - `SENTIMENT_RUN_INTERVAL` (optional override, default 1800 seconds)
-4. Railway will detect the Procfile and run:
+4. Railway will detect the Procfile and run the following processes:
    - `web`: Streamlit app
    - `worker_inflow`: XRPL inflow monitor
    - `worker_sentiment`: sentiment worker
+   - `worker_data`: 5‑minute ingestion worker that writes snapshots
+     and flows into TimescaleDB
 5. Deploy and monitor logs:
    - Web logs show Streamlit errors and API failures.
    - Worker logs show XRPL inflow and sentiment polling runs.
 6. Verify Redis keys are populated (`news:sentiment`, `xrpl:latest_inflows`, `xrpl:inflow_history`).
+
+7. When using the TimescaleDB plugin (configured in `railway.json`), set
+   the database environment variables (`PG_HOST`, `PG_PORT`,
+   `PG_USER`, `PG_PASSWORD`, `PG_DB`) in the Railway dashboard.  The
+   ingestion worker (`worker_data`) will automatically create the
+   required tables on first run and persist snapshots every 5 minutes.
 
 > **Binance key format:** paste the raw `API Key` and `Secret Key` strings from the Binance dashboard. Do **not** include `${{ }}` wrappers, quotes, or trailing spaces—formatted CI placeholders will be rejected by Binance with `API-key format invalid`. The app trims accidental surrounding quotes, but storing the bare values in Railway variables avoids silent authentication failures.
 

@@ -7,4 +7,11 @@
       "zlib1g-dev"
     ]
   }
+  ,
+  "plugins": {
+    "postgres": {
+      "engine": "timescaledb",
+      "version": "14"
+    }
+  }
 }
