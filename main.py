@@ -252,6 +252,107 @@ def compute_signal_stack(
                 note=f"${agg_oi:,.0f} aggregated OI",
             )
 
+    # Relative volume component. Measures how much the current trading volume
+    # exceeds its recent average. rVOL values greater than 1.0 indicate volume
+    # above the baseline. Full credit is achieved at rVOL ≥ 3.0 and fades to
+    # zero by 1.0.
+    rvol = futures.get("relative_volume")
+    rvol_meta = SIGNAL_COMPONENTS.get("relative_volume")
+    if rvol_meta:
+        if rvol is None:
+            add_component(
+                "relative_volume",
+                points=0.0,
+                available=False,
+                status="Volume unavailable",
+                note="Could not compute relative volume; CoinGecko volume API missing.",
+            )
+        else:
+            # Scale between 1.0 and 3.0
+            rvol_scale = _clamp((rvol - 1.0) / (3.0 - 1.0))
+            rvol_points = rvol_meta.max_points * rvol_scale
+            status = "High activity" if rvol >= 2.0 else "Average volume"
+            add_component(
+                "relative_volume",
+                points=rvol_points,
+                available=True,
+                status=status,
+                note=f"rVOL {rvol:.2f}",
+            )
+
+    # Open interest change component. Compute the delta of aggregated OI versus
+    # the previous snapshot stored in session state. Positive changes indicate
+    # additional leverage; negative changes suggest liquidation or deleveraging.
+    oi_change_meta = SIGNAL_COMPONENTS.get("oi_change")
+    if oi_change_meta:
+        agg_oi = futures.get("aggregated_open_interest")
+        last_agg = get_state("last_agg_oi", None)
+        delta_oi: Optional[float] = None
+        if agg_oi is not None and last_agg is not None:
+            delta_oi = agg_oi - last_agg
+        # Update state regardless of whether delta is computed so next call has a baseline
+        set_state("last_agg_oi", agg_oi)
+        if delta_oi is None or agg_oi is None or last_agg is None:
+            add_component(
+                "oi_change",
+                points=0.0,
+                available=False,
+                status="Change unavailable",
+                note="Insufficient history to compute OI change.",
+            )
+        else:
+            # Scale on absolute delta; full points at ±200M USD
+            abs_delta = abs(delta_oi)
+            change_scale = _clamp(abs_delta / 200_000_000.0)
+            change_points = oi_change_meta.max_points * change_scale
+            status = "Increasing OI" if delta_oi > 0 else "Decreasing OI"
+            add_component(
+                "oi_change",
+                points=change_points,
+                available=True,
+                status=status,
+                note=f"{delta_oi:,.0f} change vs. last snapshot",
+            )
+
+    # Divergence component. Detects directional disagreement between OI and price.
+    div_meta = SIGNAL_COMPONENTS.get("divergence")
+    if div_meta:
+        agg_oi = futures.get("aggregated_open_interest")
+        last_agg = get_state("last_agg_oi", None)
+        price_now = price.get("price")
+        last_price = get_state("last_price", None)
+        # Update price state for next call
+        set_state("last_price", price_now)
+        divergence_detected = False
+        if agg_oi is not None and last_agg is not None and price_now is not None and last_price is not None:
+            delta_oi = agg_oi - last_agg
+            delta_price = price_now - last_price
+            # Bullish divergence: OI ↑, price ↓; bearish divergence: OI ↓, price ↑
+            if delta_oi > 0 and delta_price < 0:
+                divergence_detected = True
+                div_status = "Bullish divergence"
+            elif delta_oi < 0 and delta_price > 0:
+                divergence_detected = True
+                div_status = "Bearish divergence"
+            else:
+                divergence_detected = False
+        if divergence_detected:
+            add_component(
+                "divergence",
+                points=div_meta.max_points,
+                available=True,
+                status=div_status,
+                note="OI and price moving in opposite directions.",
+            )
+        else:
+            add_component(
+                "divergence",
+                points=0.0,
+                available=True if (agg_oi is not None and last_agg is not None and price_now is not None and last_price is not None) else False,
+                status="No divergence",
+                note="No significant OI/price divergence detected.",
+            )
+
     inflow = flows.get("latest_inflow")
     flow_meta = SIGNAL_COMPONENTS.get("whale_flow")
     if inflow is None:
@@ -608,6 +709,88 @@ def fetch_price_snapshot() -> Dict[str, Optional[float]]:
     return {"price": None, "change": None}
 
 
+# -----------------------------------------------------------------------------
+# Volume and market analytics
+# -----------------------------------------------------------------------------
+def fetch_market_data(days: int = 30) -> Optional[List[Tuple[datetime, float, float]]]:
+    """
+    Retrieve price and volume history from CoinGecko for XRP.
+
+    This helper calls the market_chart endpoint and returns a list of
+    (timestamp, price, volume) tuples. Volumes reflect total trading volume in
+    the quote currency (USD) for each time slice. If the API call fails the
+    function returns None.
+
+    Parameters
+    ----------
+    days: int
+        Number of days of history to fetch.
+
+    Returns
+    -------
+    Optional[List[Tuple[datetime, float, float]]]
+        A list of (datetime, price, volume) tuples, or None on error.
+    """
+    try:
+        resp = requests.get(
+            f"{COINGECKO_BASE}/coins/ripple/market_chart",
+            params={"vs_currency": "usd", "days": days},
+            timeout=REQUEST_TIMEOUT,
+        )
+        if resp.ok:
+            raw = resp.json() or {}
+            prices = raw.get("prices", [])
+            vols = raw.get("total_volumes", [])
+            history: List[Tuple[datetime, float, float]] = []
+            # Ensure lengths match before zipping
+            n = min(len(prices), len(vols))
+            for idx in range(n):
+                ts_price, price_val = prices[idx]
+                _, vol_val = vols[idx]
+                history.append(
+                    (
+                        datetime.fromtimestamp(ts_price / 1000, tz=timezone.utc),
+                        float(price_val),
+                        float(vol_val),
+                    )
+                )
+            return history
+    except Exception:
+        return None
+    return None
+
+
+def compute_rvol(window: int = 20) -> Optional[float]:
+    """
+    Compute relative volume (rVOL) for XRP.
+
+    rVOL is defined as the latest volume divided by the simple moving average of
+    volume over a specified window. An rVOL > 1.0 indicates above‑average
+    participation. If insufficient data are available or the moving average is
+    zero, returns None.
+
+    Parameters
+    ----------
+    window: int
+        Number of periods for the moving average.
+
+    Returns
+    -------
+    Optional[float]
+        The relative volume, or None if unavailable.
+    """
+    history = fetch_market_data(days=30)
+    if not history or len(history) < window + 1:
+        return None
+    # Extract volumes and compute SMA
+    volumes = [vol for _, _, vol in history]
+    current_vol = volumes[-1]
+    sma = sum(volumes[-window:]) / float(window)
+    if sma <= 0:
+        return None
+    return current_vol / sma
+
+
 def cached_coingecko_simple_price() -> Dict[str, Dict[str, float]]:
     data = safe_get(
         f"{COINGECKO_BASE}/simple/price",
@@ -753,11 +936,20 @@ def fetch_funding_and_oi() -> Dict[str, Optional[float]]:
     except Exception:
         aggregated_oi = None
 
+    # Compute relative volume (rVOL) using CoinGecko volume history. This value
+    # reflects how current volume compares to its recent average. It is
+    # independent of open interest and may be missing when API calls fail.
+    try:
+        rvol = compute_rvol()
+    except Exception:
+        rvol = None
+
     return {
         "funding": funding,
         "open_interest": oi,
         "long_short_ratio": ls_ratio,
         "aggregated_open_interest": aggregated_oi,
+        "relative_volume": rvol,
     }
 
 
