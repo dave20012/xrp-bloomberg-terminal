@@ -1,33 +1,20 @@
 #!/usr/bin/env python3
 """
 import_backfill.py
-Fully automatic historical data import
-Runs as a worker script ONLY (no UI mode).
-
-Pulls:
-- Binance OHLCV + funding + OI
-- Aggregated open interest normalization
-- XRPL flows (best effort, skip 403s)
-- Writes batched into DB
-
-Requires:
-    psycopg2-binary
-    requests
-    pandas
-    python-dotenv (optional)
+Fully automatic historical data import (worker mode).
 """
 
 import os
 import sys
 import time
 import logging
-import traceback
 import pandas as pd
 import psycopg2
 from datetime import datetime, timedelta
 
-from market_data import fetch_history  # you already have this
-from xrpl_flow import pull_flows       # you already have this
+# Correct modules for your repo:
+from data_fetch import fetch_historical_market  # <-- UPDATED
+from xrpl_flow import fetch_historical_flows    # <-- UPDATED
 
 # ---------- Logging ----------
 logging.basicConfig(
@@ -39,11 +26,10 @@ logging.basicConfig(
 def get_db_url():
     public = os.getenv("DATABASE_PUBLIC_URL")
     private = os.getenv("DATABASE_URL")
-    if public and "trolley.proxy" in public:
+    # Prefer public (proxy) when running locally
+    if public and "proxy" in public:
         return public
-    if private:
-        return private
-    return None
+    return private or public
 
 # ---------- Runtime Bounds ----------
 def get_days():
@@ -53,8 +39,9 @@ def get_days():
         return 180
 
 # ---------- DB Write Helper ----------
-def db_write(table: str, df: pd.DataFrame):
+def db_write(table: str, df: pd.DataFrame, conflict_key="timestamp"):
     if df.empty:
+        logging.warning(f"⚠ No data to insert into table: {table}")
         return
 
     url = get_db_url()
@@ -69,7 +56,7 @@ def db_write(table: str, df: pd.DataFrame):
         sql = f"""
             INSERT INTO {table} ({','.join(df.columns)})
             VALUES ({placeholders})
-            ON CONFLICT (timestamp) DO NOTHING;
+            ON CONFLICT ({conflict_key}) DO NOTHING;
         """
         try:
             cur.execute(sql, tuple(row))
@@ -88,23 +75,21 @@ def main():
 
     # 1) Market + OI + Funding
     try:
-        logging.info("📊 Fetching price + funding + OI...")
-        mk = fetch_history(days)
+        logging.info("📊 Fetching historical market data...")
+        mk = fetch_historical_market(days)
         db_write("signals_snapshot", mk)
         logging.info("✔ Market backfill complete.")
     except Exception as e:
-        logging.error("Market backfill fail:")
-        logging.error(traceback.format_exc())
+        logging.error(f"Market backfill fail: {e}")
 
-    # 2) XRPL Flows (best effort)
+    # 2) XRPL Flows
     try:
-        logging.info("🌊 Importing XRPL flows...")
-        flows = pull_flows(days)
-        db_write("xrpl_flows", flows)
+        logging.info("🌊 Importing historical XRPL flows...")
+        flows = fetch_historical_flows(days)
+        db_write("xrpl_flows", flows, conflict_key="ledger_index")
         logging.info("✔ XRPL flow backfill complete.")
     except Exception as e:
-        logging.error("XRPL flow backfill fail:")
-        logging.error(traceback.format_exc())
+        logging.error(f"XRPL flow backfill fail: {e}")
 
     logging.info("🎉 Backfill fully done!")
     print("🎉 Backfill fully done!")
