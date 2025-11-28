@@ -3,7 +3,6 @@
 import math
 import os
 import importlib.util
-import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -13,7 +12,15 @@ import streamlit as st
 
 from app_utils import cache_get_json, normalize_env_value, safe_get
 from redis_client import rdb
-from signals import SIGNAL_COMPONENTS, calibrated_conviction_probability, log_score_components
+from signals import (
+    SIGNAL_COMPONENTS,
+    calibrated_conviction_probability,
+    derive_reason_codes,
+    log_score_components,
+    reason_score_adjustment,
+)
+
+from db import fetch_latest_flow, fetch_latest_snapshot
 
 # =========================
 # Page config & styling
@@ -128,6 +135,7 @@ def compute_signal_stack(
     """Translate raw telemetry into composite-ready signal contributions."""
 
     details: List[Dict[str, Any]] = []
+    reason_inputs: Dict[str, Any] = {}
 
     def add_component(
         key: str,
@@ -180,6 +188,7 @@ def compute_signal_stack(
             status=status,
             note=f"${price_usd:,.4f} vs. $2.45–$3.00 window",
         )
+        reason_inputs["price_status"] = status
 
     funding = futures.get("funding")
     fund_meta = SIGNAL_COMPONENTS.get("funding")
@@ -203,6 +212,8 @@ def compute_signal_stack(
             status=status,
             note=f"{funding_bps:+.2f} bps drift (tanh-capped)",
         )
+        # Treat funding bps as an approximate z-score proxy for reasoning.
+        reason_inputs["funding_z_score"] = funding_bps / 5.0
 
     oi_usd = futures.get("open_interest")
     oi_meta = SIGNAL_COMPONENTS.get("oi")
@@ -313,6 +324,7 @@ def compute_signal_stack(
                 status=status,
                 note=f"{delta_oi:,.0f} change vs. last snapshot",
             )
+            reason_inputs["oi_direction"] = "up" if delta_oi > 0 else "down"
 
     # Divergence component. Detects directional disagreement between OI and price.
     div_meta = SIGNAL_COMPONENTS.get("divergence")
@@ -336,6 +348,10 @@ def compute_signal_stack(
                 div_status = "Bearish divergence"
             else:
                 divergence_detected = False
+            if price_now != last_price:
+                reason_inputs["price_direction"] = "up" if delta_price > 0 else "down"
+            if delta_oi != 0:
+                reason_inputs["oi_direction"] = "up" if delta_oi > 0 else "down"
         if divergence_detected:
             add_component(
                 "divergence",
@@ -397,6 +413,7 @@ def compute_signal_stack(
             status=status,
             note=f"{withdrawals:,.0f} XRP 24h net withdrawal bias",
         )
+        reason_inputs["netflow_xrp"] = withdrawals if outflow >= inflow else inflow - outflow
 
     sentiment_ema = sentiment.get("ema")
     sent_meta = SIGNAL_COMPONENTS.get("sentiment")
@@ -419,6 +436,7 @@ def compute_signal_stack(
             status=status,
             note=f"EMA {sentiment_ema:+.2f} vs. +0.05/+0.30 lane",
         )
+        reason_inputs["sentiment_ema"] = sentiment_ema
 
     # Long/short ratio based squeeze component. A value ≤1.0 implies more shorts
     # than longs, favouring a short‑squeeze setup; values ≥2.0 imply longs dominate.
@@ -462,6 +480,7 @@ def compute_signal_stack(
         "composite": normalized,
         "probability": calibrated_conviction_probability(normalized),
         "coverage": total_cap,
+        "reason_inputs": reason_inputs,
     }
 
 
@@ -1043,6 +1062,64 @@ def fetch_sentiment() -> Dict[str, Any]:
     }
 
 
+def hydrate_with_db_fallbacks(
+    price_snapshot: Dict[str, Optional[float]],
+    futures: Dict[str, Optional[float]],
+    flows: Dict[str, Any],
+    sentiment: Dict[str, Any],
+) -> List[str]:
+    """Fill missing telemetry from the PostgreSQL snapshot tables."""
+
+    notes: List[str] = []
+
+    try:
+        snap = fetch_latest_snapshot()
+    except Exception as exc:  # noqa: BLE001
+        snap = None
+        notes.append(f"DB snapshot unavailable ({exc})")
+
+    if snap:
+        (_, price_db, oi_total, funding_db, ls_ratio_db, rvol_db, _, _, _) = snap
+        if price_snapshot.get("price") is None and price_db is not None:
+            price_snapshot["price"] = float(price_db)
+            notes.append("price from DB")
+        if futures.get("aggregated_open_interest") is None and oi_total is not None:
+            futures["aggregated_open_interest"] = float(oi_total)
+            notes.append("agg OI from DB")
+        if futures.get("funding") is None and funding_db is not None:
+            futures["funding"] = float(funding_db)
+            notes.append("funding from DB")
+        if futures.get("long_short_ratio") is None and ls_ratio_db is not None:
+            futures["long_short_ratio"] = float(ls_ratio_db)
+            notes.append("L/S from DB")
+        if futures.get("relative_volume") is None and rvol_db is not None:
+            futures["relative_volume"] = float(rvol_db)
+            notes.append("rVOL from DB")
+
+    try:
+        flow_row = fetch_latest_flow()
+    except Exception as exc:  # noqa: BLE001
+        flow_row = None
+        notes.append(f"flows fallback failed ({exc})")
+
+    if flow_row:
+        if not isinstance(flows, dict):
+            flows = {}
+        _, flow_in, flow_out, _ = flow_row
+        if flows.get("latest_inflow") in (None, 0.0) and flow_in is not None:
+            flows["latest_inflow"] = float(flow_in)
+            notes.append("XRPL inflow from DB")
+        if flows.get("latest_outflow") in (None, 0.0) and flow_out is not None:
+            flows["latest_outflow"] = float(flow_out)
+            notes.append("XRPL outflow from DB")
+
+    if sentiment.get("ema") is None:
+        # Sentiment snapshots are not yet persisted to Postgres.
+        notes.append("sentiment cache only")
+
+    return notes
+
+
 def fetch_live() -> Dict[str, float]:
     """Backward-compatible live snapshot used by unit tests and workers."""
 
@@ -1123,28 +1200,56 @@ def render_market_header(price: Dict[str, Optional[float]], flows: Dict[str, Any
         )
 
 
-def render_signal_panel(stack: Dict[str, Any]) -> None:
+def render_signal_panel(
+    stack: Dict[str, Any],
+    reasons: List[str],
+    adjusted_composite: float,
+    reason_adjustment_pts: float,
+    fallback_notes: List[str],
+) -> None:
     st.markdown("### Signals & Conviction")
 
-    composite = stack.get("composite", 0.0)
-    conviction_pct = stack.get("probability", 0.0) * 100.0
+    raw_composite = stack.get("composite", 0.0)
+    raw_conviction = stack.get("probability", 0.0) * 100.0
+    adj_conviction = calibrated_conviction_probability(adjusted_composite) * 100.0
+    coverage = stack.get("coverage", 0.0) or 0.0
 
-    col_a, col_b = st.columns([1.4, 1])
+    col_a, col_b, col_c = st.columns([1.2, 1.1, 1])
     with col_a:
         styled_metric(
-            "Composite Score",
-            f"{composite:.1f} / 100",
-            f"Bullish conviction {conviction_pct:.1f}% (coverage weighted)",
+            "Conviction (adj)",
+            f"{adjusted_composite:.1f} / 100",
+            f"Qual tilt {reason_adjustment_pts:+.1f} pts · {adj_conviction:.1f}% calibrated",
         )
-        st.progress(composite / 100.0)
+        st.progress(adjusted_composite / 100.0)
+
+    with col_b:
+        styled_metric(
+            "Quant-only composite",
+            f"{raw_composite:.1f} / 100",
+            f"{raw_conviction:.1f}% calibrated · Coverage {coverage:.1f} pts",
+        )
+        st.progress(raw_composite / 100.0)
 
     missing = [d for d in stack.get("details", []) if not d.get("available")]
-    if missing:
-        with col_b:
-            st.info(
-                "Signals rescaled to available inputs; missing feeds: "
-                + ", ".join(d.get("name", d.get("key", "")) for d in missing)
-            )
+    if missing or fallback_notes:
+        with col_c:
+            if missing:
+                st.info(
+                    "Signals rescaled to available inputs; missing feeds: "
+                    + ", ".join(d.get("name", d.get("key", "")) for d in missing)
+                )
+            if fallback_notes:
+                st.caption("Fallbacks → " + " | ".join(fallback_notes))
+
+    if reasons:
+        st.markdown("#### Why now (reason codes)")
+        st.markdown(
+            " ".join(
+                f"<span class='tag tag-ok'>{reason}</span>" for reason in reasons
+            ),
+            unsafe_allow_html=True,
+        )
 
     for detail in stack.get("details", []):
         max_points = detail.get("max_points") or 1.0
@@ -1344,14 +1449,33 @@ price_history = fetch_price_history()
 futures = fetch_funding_and_oi()
 flows = fetch_xrpl_flows()
 sentiment = fetch_sentiment()
+fallback_notes = hydrate_with_db_fallbacks(price_snapshot, futures, flows, sentiment)
 signal_stack = compute_signal_stack(price_snapshot, futures, flows, sentiment)
+reason_inputs = signal_stack.get("reason_inputs", {}) or {}
+if "netflow_xrp" not in reason_inputs:
+    inflow_val = flows.get("latest_inflow") if isinstance(flows, dict) else None
+    outflow_val = flows.get("latest_outflow") if isinstance(flows, dict) else None
+    if inflow_val is not None and outflow_val is not None:
+        reason_inputs["netflow_xrp"] = float(outflow_val) - float(inflow_val)
+reasons = derive_reason_codes(reason_inputs)
+reason_adjustment_pts = reason_score_adjustment(reasons)
+coverage_budget = signal_stack.get("coverage", 0.0) or 0.0
+raw_composite = signal_stack.get("composite", 0.0) or 0.0
+if coverage_budget > 0:
+    adjusted_composite = max(
+        0.0, min(100.0, raw_composite + (reason_adjustment_pts / coverage_budget) * 100.0)
+    )
+else:
+    adjusted_composite = raw_composite
 
 render_market_header(price_snapshot, flows)
 st.divider()
 
 col_left, col_right = st.columns([1.4, 1])
 with col_left:
-    render_signal_panel(signal_stack)
+    render_signal_panel(
+        signal_stack, reasons, adjusted_composite, reason_adjustment_pts, fallback_notes
+    )
     st.divider()
     render_price_panel(price_history)
     st.divider()
