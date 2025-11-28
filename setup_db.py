@@ -37,6 +37,17 @@ def get_correct_db_url():
 
 
 SQL = """
+DROP TABLE IF EXISTS market_history;
+
+CREATE TABLE market_history (
+    timestamp TIMESTAMPTZ PRIMARY KEY,
+    price_close NUMERIC,
+    volume NUMERIC,
+    aggregated_oi_usd NUMERIC,
+    funding_rate NUMERIC,
+    long_short_ratio NUMERIC
+);
+
 CREATE TABLE IF NOT EXISTS signals_snapshot (
     timestamp        TIMESTAMPTZ PRIMARY KEY,
     price_usd        NUMERIC,
