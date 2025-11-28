@@ -1,87 +1,99 @@
-#!/usr/bin/env python3
 """
 import_backfill.py
-Historical backfill for XRP Quant Console.
+
+Imports historical market data from a CSV (produced by fetch_history.py)
+into the Postgres `market_history` table.
+
+Assumes columns:
+    timestamp, price_close, volume,
+    aggregated_oi_usd, funding_rate, long_short_ratio
+
+Usage:
+    railway run python import_backfill.py --csv historical.csv
 """
 
+from __future__ import annotations
 import os
-import logging
-import psycopg2
+import argparse
+
 import pandas as pd
+import psycopg2
+from psycopg2.extras import execute_batch
 
-from fetch_history import fetch_historical_market
-from xrpl_inflow_monitor import fetch_historical_flows
 
-# ---------- Logging ----------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(levelname)s: %(message)s"
-)
+def load_csv(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    if "timestamp" not in df.columns:
+        raise ValueError("CSV must contain 'timestamp' column.")
+    # Basic cleaning; keep as-is, you already filtered future rows in fetch_history
+    return df
 
-# ---------- DB URL Selector ----------
-def get_db_url():
-    # Prefer public proxy for local runs
-    public = os.getenv("DATABASE_PUBLIC_URL")
-    private = os.getenv("DATABASE_URL")
 
-    if public and "proxy" in public:
-        return public
-    return private or public
+def float_or_none(x):
+    if pd.isna(x):
+        return None
+    return float(x)
 
-# ---------- Write Helper ----------
-def insert_dataframe(table: str, df: pd.DataFrame, conflict_key="timestamp"):
-    if df.empty:
-        logging.warning(f"⚠ No data fetched for table: {table}")
-        return
 
-    url = get_db_url()
-    if not url:
-        raise ValueError("💥 No DATABASE_URL / DATABASE_PUBLIC_URL found.")
+def insert_market_history(df: pd.DataFrame, db_url: str, batch_size: int = 1000):
+    conn = psycopg2.connect(db_url)
+    try:
+        with conn.cursor() as cur:
+            sql = """
+            INSERT INTO market_history (
+                timestamp,
+                price_close,
+                volume,
+                aggregated_oi_usd,
+                funding_rate,
+                long_short_ratio
+            ) VALUES (%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (timestamp) DO UPDATE
+            SET
+                price_close       = EXCLUDED.price_close,
+                volume            = EXCLUDED.volume,
+                aggregated_oi_usd = EXCLUDED.aggregated_oi_usd,
+                funding_rate      = EXCLUDED.funding_rate,
+                long_short_ratio  = EXCLUDED.long_short_ratio;
+            """
 
-    conn = psycopg2.connect(url, sslmode="require")
-    cur = conn.cursor()
+            rows = []
+            for _, r in df.iterrows():
+                rows.append(
+                    (
+                        r["timestamp"],
+                        float_or_none(r.get("price_close")),
+                        float_or_none(r.get("volume")),
+                        float_or_none(r.get("aggregated_oi_usd")),
+                        float_or_none(r.get("funding_rate")),
+                        float_or_none(r.get("long_short_ratio")),
+                    )
+                )
 
-    for _, row in df.iterrows():
-        cols = ",".join(df.columns)
-        placeholders = ",".join(["%s"] * len(row))
-        sql = f"""
-            INSERT INTO {table} ({cols})
-            VALUES ({placeholders})
-            ON CONFLICT ({conflict_key}) DO NOTHING;
-        """
-        try:
-            cur.execute(sql, tuple(row))
-        except Exception as e:
-            logging.error(f"💥 Insert failed [{table}]: {e}")
+            print(f"📥 Inserting {len(rows)} rows into market_history ...")
+            for i in range(0, len(rows), batch_size):
+                chunk = rows[i : i + batch_size]
+                execute_batch(cur, sql, chunk)
+                conn.commit()
+                print(f"  ... {min(i + batch_size, len(rows))}/{len(rows)} committed")
 
-    conn.commit()
-    cur.close()
-    conn.close()
+    finally:
+        conn.close()
+    print("🎉 Import complete.")
 
-# ---------- MAIN ----------
+
 def main():
-    days = int(os.getenv("BACKFILL_DAYS", "180"))
-    logging.info(f"📥 Backfilling {days} days of data ..")
+    parser = argparse.ArgumentParser(description="Import historical market data CSV into Postgres.")
+    parser.add_argument("--csv", required=True, help="Path to historical.csv")
+    args = parser.parse_args()
 
-    # 1) Market Data
-    try:
-        logging.info("📊 Fetching market history (price, funding, OI)..")
-        mk = fetch_historical_market(days)
-        insert_dataframe("signals_snapshot", mk)
-        logging.info("✔ Market history imported.")
-    except Exception as e:
-        logging.error(f"❌ Market backfill error: {e}")
+    db_url = os.getenv("DATABASE_URL")
+    if not db_url:
+        raise SystemExit("❌ DATABASE_URL not set. Run via `railway run` or export locally.")
 
-    # 2) XRPL Flows
-    try:
-        logging.info("🌊 Fetching XRPL inflow/outflow history..")
-        flows = fetch_historical_flows(days)
-        insert_dataframe("xrpl_flows", flows, conflict_key="ledger_index")
-        logging.info("✔ XRPL flows imported.")
-    except Exception as e:
-        logging.error(f"❌ XRPL flow backfill error: {e}")
+    df = load_csv(args.csv)
+    insert_market_history(df, db_url)
 
-    logging.info("🎉 FULL BACKFILL COMPLETE")
 
 if __name__ == "__main__":
     main()

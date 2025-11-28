@@ -3,13 +3,14 @@ Historical market data fetching utilities for the XRP quant dashboard.
 
 This script:
 - Fetches 5m spot price & volume from Binance.
-- Fetches open interest (OI) where Binance allows it (only recent ~30 days).
-- Fetches global long/short account ratio (LS) where available.
+- Fetches open interest (OI) where Binance allows it (recent ~30 days max).
+- Fetches global long/short account ratio (LS) where available (same window).
 - Fetches funding rates (8h buckets) and aligns them to 5m bars.
 - Safely handles long date ranges by chunking.
 - Clamps future end dates to 'now' to avoid invalid Binance requests.
+- Drops ONLY future rows that have neither OI nor LS (your requested rule).
 
-Output columns:
+Output CSV columns:
     timestamp (ISO 8601 string, UTC)
     price_close (float)
     volume (float)
@@ -29,7 +30,7 @@ import requests
 from dateutil.parser import isoparse
 
 # -------------------------------------------------------------------
-# Binance endpoints
+# Binance endpoints / constants
 # -------------------------------------------------------------------
 BINANCE_SPOT = "https://api.binance.com"
 BINANCE_FAPI = "https://fapi.binance.com"
@@ -40,12 +41,11 @@ INTERVAL = "5m"
 FIVE_MIN_MS = 5 * 60 * 1000
 EIGHT_HOURS_MS = 8 * 60 * 60 * 1000
 
-# For chunking the overall date range (for spot/funding/LS)
+# Chunk size for spot/funding/LS fetching
 MAX_CHUNK_DAYS = 30
 
-# Hard limit: Binance futures data OI endpoints only support recent history.
-# We will only attempt OI/LS if start_time >= (now - OI_LOOKBACK_DAYS).
-OI_LOOKBACK_DAYS = 30  # conservative; Binance states "last 30 days" for some endpoints
+# Binance derivatives HTTP retention (conservative)
+OI_LOOKBACK_DAYS = 30  # OI + LS beyond this are not reliably served by HTTP
 
 
 # -------------------------------------------------------------------
@@ -136,7 +136,7 @@ def fetch_oi_hist(symbol: str, start: datetime, end: datetime) -> List[Dict]:
     """
     Fetch OI history from /futures/data/openInterestHist.
 
-    Binance only supports relatively recent history (docs specify last ~30 days).
+    Binance only supports relatively recent history (docs and practice show ~30 days).
     We clamp any start earlier than (now - OI_LOOKBACK_DAYS) and
     if the requested window is entirely older, we return [] and DO NOT raise.
     """
@@ -151,10 +151,15 @@ def fetch_oi_hist(symbol: str, start: datetime, end: datetime) -> List[Dict]:
         print("ℹ OI: requested window is older than Binance retention; skipping OI (will be null).")
         return out
 
-    # Clamp start time to min_start to avoid 400 invalid startTime.
+    # Clamp start time to min_start to avoid invalid startTime.
     if start < min_start:
         print(f"ℹ OI: clamping start from {start.date()} to {min_start.date()} to satisfy Binance limits.")
         start = min_start
+
+    # Also ensure we never ask past 'now'
+    if end > now:
+        print(f"ℹ OI: clamping end from {end.date()} to {now.date()} (no future data).")
+        end = now
 
     start_ms = int(start.timestamp() * 1000)
     end_ms = int(end.timestamp() * 1000)
@@ -171,7 +176,6 @@ def fetch_oi_hist(symbol: str, start: datetime, end: datetime) -> List[Dict]:
         try:
             data = _safe_get(f"{BINANCE_FUTURES_DATA}/openInterestHist", params)
         except RuntimeError as e:
-            # If Binance still rejects it, log and bail out gracefully.
             print(f"⚠ OI fetch failed: {e}. Skipping OI for this window.")
             return []
 
@@ -209,6 +213,10 @@ def fetch_ls_ratio(symbol: str, start: datetime, end: datetime) -> List[Dict]:
     if start < min_start:
         print(f"ℹ LS ratio: clamping start from {start.date()} to {min_start.date()}.")
         start = min_start
+
+    if end > now:
+        print(f"ℹ LS ratio: clamping end from {end.date()} to {now.date()} (no future data).")
+        end = now
 
     start_ms = int(start.timestamp() * 1000)
     end_ms = int(end.timestamp() * 1000)
@@ -294,10 +302,12 @@ def fetch_funding_hist(symbol: str, start: datetime, end: datetime) -> List[Dict
 def fetch_historical_market(start: datetime, end: datetime) -> pd.DataFrame:
     """
     Fetch historical market and derivatives data for XRPUSDT across [start, end).
-    This function:
+
+    Behaviour:
       - Clamps end to <= now (no future queries).
       - Splits the range into MAX_CHUNK_DAYS chunks.
       - For each chunk, fetches spot, OI, LS, funding and merges into 5m bars.
+      - At the end, drops ONLY future rows where both OI and LS are null.
     """
     start = _ensure_utc(start)
     end = _ensure_utc(end)
@@ -351,8 +361,21 @@ def fetch_historical_market(start: datetime, end: datetime) -> pd.DataFrame:
         cur = chunk_end
 
     df = pd.DataFrame.from_records(all_records)
+    if df.empty:
+        return df
+
+    # Ensure chronological
     df.sort_values("timestamp", inplace=True)
     df.reset_index(drop=True, inplace=True)
+
+    # Drop ONLY future rows where BOTH OI & LS are null
+    df["timestamp_dt"] = pd.to_datetime(df["timestamp"], utc=True)
+    now_utc = datetime.now(timezone.utc)
+    mask_future = df["timestamp_dt"] > now_utc
+    mask_both_null = df["aggregated_oi_usd"].isna() & df["long_short_ratio"].isna()
+    df = df[~(mask_future & mask_both_null)]
+    df.drop(columns=["timestamp_dt"], inplace=True)
+
     return df
 
 
