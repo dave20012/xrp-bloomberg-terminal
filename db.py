@@ -298,3 +298,44 @@ def insert_signal_snapshot(row: Tuple) -> None:
                                divergence      = EXCLUDED.divergence,
                                composite_score= EXCLUDED.composite_score;
                 """
+                """,
+                row,
+            )
+    conn.close()
+
+
+def fetch_latest_snapshot() -> Optional[Tuple]:
+    """
+    Retrieve the latest signals snapshot from the database.
+    Returns a tuple or None if no data exists.
+    """
+    conn = get_connection()
+    row: Optional[Tuple] = None
+    with conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT timestamp, price, oi_total, funding_rt, ls_ratio, rvol, oi_change, divergence, composite_score FROM signals_snapshot ORDER BY timestamp DESC LIMIT 1;"
+            )
+            result = cur.fetchone()
+            if result:
+                row = result
+    conn.close()
+    return row
+
+
+def fetch_latest_flow() -> Optional[Tuple]:
+    """Return the newest on-chain flow tuple from the database."""
+
+    conn = get_connection()
+    row: Optional[Tuple] = None
+    with conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT timestamp, flow_in_xrp, flow_out_xrp, net_flow_xrp FROM onchain_flows ORDER BY timestamp DESC LIMIT 1;"
+            )
+            result = cur.fetchone()
+            if result:
+                row = result
+    conn.close()
+    return row
+
