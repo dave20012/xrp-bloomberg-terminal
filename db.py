@@ -6,7 +6,8 @@ database and insert or upsert records for different metric tables.
 
 Environment variables expected:
 
-    PG_HOST: hostname of the PostgreSQL server
+    PG_URL or DATABASE_URL: full PostgreSQL connection string (preferred)
+    PG_HOST: hostname of the PostgreSQL server (used when URL is absent)
     PG_PORT: port of the PostgreSQL server (optional, default 5432)
     PG_USER: database user
     PG_PASSWORD: database password
@@ -20,19 +21,51 @@ not already exist.
 from __future__ import annotations
 
 import os
+from typing import Iterable, Optional, Tuple
+
 import psycopg2
 from psycopg2.extras import execute_batch
-from typing import Iterable, Optional, Tuple
+
+from app_utils import normalize_env_value
+
+
+def _clean_env(name: str, *, default: str = "") -> str:
+    """Return a trimmed environment variable, preserving an optional default."""
+
+    raw = normalize_env_value(name)
+    return raw if raw else default
 
 
 def get_connection() -> psycopg2.extensions.connection:
-    """Create a new database connection using environment variables."""
+    """Create a new database connection using environment variables.
+
+    Preferred inputs:
+    - ``PG_URL`` or ``DATABASE_URL`` set to a full PostgreSQL connection URL
+      (e.g. ``postgresql://user:pass@host:5432/dbname?sslmode=require``).
+    - Otherwise, individual ``PG_HOST``, ``PG_PORT``, ``PG_USER``, ``PG_PASSWORD``,
+      and ``PG_DB`` values are used after being trimmed of stray quotes/whitespace.
+    """
+
+    # Allow a single URL-style secret to drive the connection for external hosts.
+    pg_url = _clean_env("PG_URL") or _clean_env("DATABASE_URL")
+    if pg_url and not pg_url.startswith("${"):
+        return psycopg2.connect(dsn=pg_url)
+
+    host = _clean_env("PG_HOST")
+    user = _clean_env("PG_USER")
+    dbname = _clean_env("PG_DB")
+
+    if not all([host, user, dbname]):
+        raise ValueError(
+            "Missing database settings: set PG_URL/DATABASE_URL or PG_HOST/PG_USER/PG_DB."
+        )
+
     return psycopg2.connect(
-        host=os.getenv("PG_HOST"),
-        port=os.getenv("PG_PORT", "5432"),
-        user=os.getenv("PG_USER"),
-        password=os.getenv("PG_PASSWORD"),
-        dbname=os.getenv("PG_DB"),
+        host=host,
+        port=_clean_env("PG_PORT", default=os.getenv("PG_PORT", "5432")),
+        user=user,
+        password=_clean_env("PG_PASSWORD"),
+        dbname=dbname,
     )
 
 
