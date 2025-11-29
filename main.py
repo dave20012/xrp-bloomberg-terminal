@@ -42,79 +42,12 @@ from signals import (
     reason_score_adjustment,
 )
 
-from db import fetch_latest_flow, fetch_latest_snapshot, initialize_db
+from db import fetch_latest_flow, fetch_latest_snapshot
 from xrpl_utils import fetch_account_overview, parse_account_input
 
 # PATCH: Additional imports for autorefresh fallback.
 import threading
 import time
-
-
-# -----------------------------------------------------------------------------
-# Initialisation
-#
-# The Streamlit runtime executes this script top‑to‑bottom on each rerun.
-# Before rendering any UI we ensure the database schema exists and set up
-# a periodic refresh mechanism.  The autorefresh utility triggers a rerun
-# without performing a full page reload, preserving state and avoiding
-# flicker.  When the optional ``streamlit_autorefresh`` package is not
-# available a background thread calls ``st.experimental_rerun`` instead.
-
-def _setup_database() -> None:
-    """Ensure the database schema is created.
-
-    The ``initialize_db`` function is idempotent and may be called on every
-    rerun without adverse effects.  It creates tables and hypertables
-    required by the dashboard.  Should this call fail it will raise
-    synchronously, surfacing an error in the UI.
-    """
-
-    try:
-        initialize_db()
-    except Exception as exc:  # noqa: BLE001
-        st.error(f"Failed to initialise database: {exc}")
-
-
-def _setup_autorefresh(interval_sec: int = 60) -> None:
-    """Configure automatic page refresh without full reload.
-
-    Uses the ``streamlit_autorefresh`` component if installed.  In
-    environments where that package is unavailable, a background thread
-    triggers an ``st.experimental_rerun`` after the specified interval.
-
-    Args:
-        interval_sec: Number of seconds between reruns.
-    """
-
-    try:
-        # Dynamically import to avoid hard dependency.
-        import importlib
-        autorefresh_mod = importlib.import_module("streamlit_autorefresh")
-        if hasattr(autorefresh_mod, "st_autorefresh"):
-            autorefresh_mod.st_autorefresh(interval=interval_sec * 1000, key="data_refresh")
-            return
-    except Exception:
-        pass
-
-    # Fallback: spawn a daemon thread that sleeps and then reruns.
-    def _rerun_after_delay() -> None:
-        time.sleep(interval_sec)
-        try:
-            st.experimental_rerun()
-        except Exception:
-            pass
-
-    # Start the thread only once per session by storing a flag in session state.
-    if not st.session_state.get("__auto_thread_started__"):
-        st.session_state["__auto_thread_started__"] = True
-        threading.Thread(target=_rerun_after_delay, daemon=True).start()
-
-
-# Run set‑up steps at import time.  Streamlit caches module state across
-# reruns, so these calls will not execute repeatedly during a single
-# session.
-_setup_database()
-_setup_autorefresh()
 
 # =========================
 # Page config & styling
@@ -318,7 +251,6 @@ def compute_signal_stack(
             status=status,
             note=f"{funding_bps:+.2f} bps drift (tanh-capped)",
         )
-        # Treat funding bps as an approximate z-score proxy for reasoning.
         reason_inputs["funding_z_score"] = funding_bps / 5.0
 
     oi_usd = futures.get("open_interest")
@@ -343,9 +275,6 @@ def compute_signal_stack(
             note=f"${oi_usd:,.0f} open interest vs. $1.5B–$2.7B lane",
         )
 
-    # Aggregated open interest across exchanges (Binance + Bybit). This
-    # component rewards multi‑venue liquidity. Full points are awarded when
-    # aggregated OI exceeds $4B and decays linearly to $2B.
     agg_oi = futures.get("aggregated_open_interest")
     agg_meta = SIGNAL_COMPONENTS.get("oi_aggregated")
     if agg_meta:
@@ -369,10 +298,6 @@ def compute_signal_stack(
                 note=f"${agg_oi:,.0f} aggregated OI",
             )
 
-    # Relative volume component. Measures how much the current trading volume
-    # exceeds its recent average. rVOL values greater than 1.0 indicate volume
-    # above the baseline. Full credit is achieved at rVOL ≥ 3.0 and fades to
-    # zero by 1.0.
     rvol = futures.get("relative_volume")
     rvol_meta = SIGNAL_COMPONENTS.get("relative_volume")
     if rvol_meta:
@@ -385,7 +310,6 @@ def compute_signal_stack(
                 note="Could not compute relative volume; CoinGecko volume API missing.",
             )
         else:
-            # Scale between 1.0 and 3.0
             rvol_scale = _clamp((rvol - 1.0) / (3.0 - 1.0))
             rvol_points = rvol_meta.max_points * rvol_scale
             status = "High activity" if rvol >= 2.0 else "Average volume"
@@ -397,9 +321,6 @@ def compute_signal_stack(
                 note=f"rVOL {rvol:.2f}",
             )
 
-    # Open interest change component. Compute the delta of aggregated OI versus
-    # the previous snapshot stored in session state. Positive changes indicate
-    # additional leverage; negative changes suggest liquidation or deleveraging.
     oi_change_meta = SIGNAL_COMPONENTS.get("oi_change")
     if oi_change_meta:
         agg_oi = futures.get("aggregated_open_interest")
@@ -416,7 +337,6 @@ def compute_signal_stack(
                 note="Insufficient history to compute OI change.",
             )
         else:
-            # Scale on absolute delta; full points at ±200M USD
             abs_delta = abs(delta_oi)
             change_scale = _clamp(abs_delta / 200_000_000.0)
             change_points = oi_change_meta.max_points * change_scale
@@ -430,7 +350,6 @@ def compute_signal_stack(
             )
             reason_inputs["oi_direction"] = "up" if delta_oi > 0 else "down"
 
-    # Divergence component. Detects directional disagreement between OI and price.
     div_meta = SIGNAL_COMPONENTS.get("divergence")
     if div_meta:
         agg_oi = futures.get("aggregated_open_interest")
@@ -441,7 +360,6 @@ def compute_signal_stack(
         if agg_oi is not None and last_agg is not None and price_now is not None and last_price is not None:
             delta_oi = agg_oi - last_agg
             delta_price = price_now - last_price
-            # Bullish divergence: OI ↑, price ↓; bearish divergence: OI ↓, price ↑
             if delta_oi > 0 and delta_price < 0:
                 divergence_detected = True
                 div_status = "Bullish divergence"
@@ -466,10 +384,11 @@ def compute_signal_stack(
             add_component(
                 "divergence",
                 points=0.0,
-                available=True if (agg_oi is not None and last_agg is not None and price_now is not None and last_price is not None) else False,
+                available=True,
                 status="No divergence",
-                note="No significant OI/price divergence detected.",
+                note="",
             )
+
 
     if price.get("price") is not None:
         set_state("last_price", price.get("price"))
