@@ -4,6 +4,8 @@ import os
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
+import ipaddress
 
 import requests
 
@@ -45,12 +47,53 @@ def cache_get_json(key: str) -> Any:
     return None
 
 
+def _is_private_host(hostname: str) -> bool:
+    """Return True when the host is private/loopback/reserved.
+
+    This helps callers avoid SSRF-style lookups when user-provided URLs slip
+    through. Hostnames such as localhost and .local domains are blocked in
+    addition to RFC1918/loopback/reserved IP ranges.
+    """
+
+    if not hostname:
+        return True
+
+    lowered = hostname.lower()
+    if lowered == "localhost" or lowered.endswith(".local"):
+        return True
+
+    try:
+        ip_obj = ipaddress.ip_address(hostname)
+        return ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_reserved
+    except ValueError:
+        return False
+
+
+def is_safe_url(url: str) -> bool:
+    """Conservatively validate that a URL is HTTPS and not local/internal."""
+
+    if not url:
+        return False
+
+    parsed = urlparse(url)
+    if parsed.scheme.lower() != "https":
+        return False
+    if not parsed.hostname:
+        return False
+    if _is_private_host(parsed.hostname):
+        return False
+    return True
+
+
 def safe_get(
     url: str,
     params: Optional[Dict[str, Any]] = None,
     timeout: int = 10,
     headers: Optional[Dict[str, str]] = None,
 ) -> Any:
+    if not is_safe_url(url):
+        logger.warning("Blocked request to unsafe URL: %s", url)
+        return None
     try:
         resp = requests.get(url, params=params, timeout=timeout, headers=headers)
         if resp.status_code == 429:
