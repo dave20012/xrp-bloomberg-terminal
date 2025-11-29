@@ -68,16 +68,19 @@ SESSION_FALLBACK: Dict[str, Any] = {}
 
 def get_state(key: str, default: Any) -> Any:
     try:
-        return st.session_state.get(key, default)
+        if key in st.session_state:
+            return st.session_state.get(key, default)
     except Exception:  # noqa: BLE001
-        return SESSION_FALLBACK.get(key, default)
+        pass
+    return SESSION_FALLBACK.get(key, default)
 
 
 def set_state(key: str, value: Any) -> None:
+    SESSION_FALLBACK[key] = value
     try:
         st.session_state[key] = value
     except Exception:  # noqa: BLE001
-        SESSION_FALLBACK[key] = value
+        return
 
 
 def redact_secret(value: str, keep: int = 4) -> str:
@@ -136,6 +139,8 @@ def compute_signal_stack(
 
     details: List[Dict[str, Any]] = []
     reason_inputs: Dict[str, Any] = {}
+    prev_price = get_state("last_price", None)
+    prev_agg_oi = get_state("last_agg_oi", None)
 
     def add_component(
         key: str,
@@ -297,12 +302,10 @@ def compute_signal_stack(
     oi_change_meta = SIGNAL_COMPONENTS.get("oi_change")
     if oi_change_meta:
         agg_oi = futures.get("aggregated_open_interest")
-        last_agg = get_state("last_agg_oi", None)
+        last_agg = prev_agg_oi
         delta_oi: Optional[float] = None
         if agg_oi is not None and last_agg is not None:
             delta_oi = agg_oi - last_agg
-        # Update state regardless of whether delta is computed so next call has a baseline
-        set_state("last_agg_oi", agg_oi)
         if delta_oi is None or agg_oi is None or last_agg is None:
             add_component(
                 "oi_change",
@@ -330,11 +333,9 @@ def compute_signal_stack(
     div_meta = SIGNAL_COMPONENTS.get("divergence")
     if div_meta:
         agg_oi = futures.get("aggregated_open_interest")
-        last_agg = get_state("last_agg_oi", None)
+        last_agg = prev_agg_oi
         price_now = price.get("price")
-        last_price = get_state("last_price", None)
-        # Update price state for next call
-        set_state("last_price", price_now)
+        last_price = prev_price
         divergence_detected = False
         if agg_oi is not None and last_agg is not None and price_now is not None and last_price is not None:
             delta_oi = agg_oi - last_agg
@@ -368,6 +369,11 @@ def compute_signal_stack(
                 status="No divergence",
                 note="No significant OI/price divergence detected.",
             )
+
+    if price.get("price") is not None:
+        set_state("last_price", price.get("price"))
+    if futures.get("aggregated_open_interest") is not None:
+        set_state("last_agg_oi", futures.get("aggregated_open_interest"))
 
     inflow = flows.get("latest_inflow")
     flow_meta = SIGNAL_COMPONENTS.get("whale_flow")
