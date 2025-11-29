@@ -21,6 +21,7 @@ from signals import (
 )
 
 from db import fetch_latest_flow, fetch_latest_snapshot
+from xrpl_utils import fetch_account_overview, parse_account_input
 
 # =========================
 # Page config & styling
@@ -127,6 +128,13 @@ def styled_metric(title: str, value: str, note: str = "") -> None:
 
 def _clamp(value: float, *, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, value))
+
+
+def drops_to_xrp(value: Optional[float]) -> float:
+    try:
+        return float(value or 0.0) / 1_000_000
+    except Exception:  # noqa: BLE001
+        return 0.0
 
 
 def compute_signal_stack(
@@ -1181,6 +1189,11 @@ def fetch_live() -> Dict[str, float]:
     }
 
 
+@st.cache_data(ttl=180, show_spinner=False)
+def load_account_snapshot(address: str) -> Dict[str, Any]:
+    return fetch_account_overview(address)
+
+
 # =========================
 # Presentation
 # =========================
@@ -1417,6 +1430,77 @@ def render_health_panel(creds: Dict[str, str], price: Dict[str, Optional[float]]
     )
 
 
+def render_account_panel(
+    address: Optional[str],
+    tag: Optional[int],
+    overview: Dict[str, Any],
+    notes: List[str],
+) -> None:
+    st.markdown("### XRPL Account Intelligence")
+
+    if notes:
+        st.caption(" | ".join(notes))
+
+    if not address:
+        st.info("Enter a classic address or X-address with tag to inspect balances and flows.")
+        return
+
+    if overview.get("account") is None:
+        st.warning("XRPL account snapshot unavailable (offline mode or invalid address).")
+        return
+
+    account_data = overview.get("account") or {}
+    balance = drops_to_xrp(account_data.get("Balance"))
+    reserve = account_data.get("OwnerCount") or 0
+    sequence = account_data.get("Sequence")
+
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        styled_metric("Balance", f"{balance:,.2f} XRP", f"Seq {sequence or '-'}")
+    with col_b:
+        styled_metric("Owner Count", f"{reserve}", "Objects impacting reserve")
+    with col_c:
+        styled_metric("Tag", str(tag) if tag is not None else "–", "Destination tag (optional)")
+
+    trustlines = overview.get("trustlines") or []
+    offers = overview.get("offers") or []
+    txs = overview.get("transactions") or []
+
+    with st.expander("Trustlines & AMM exposures", expanded=False):
+        if trustlines:
+            st.dataframe(
+                [
+                    {
+                        "Counterparty": tl.get("account"),
+                        "Currency": tl.get("currency"),
+                        "Balance": tl.get("balance"),
+                        "Limit": tl.get("limit"),
+                    }
+                    for tl in trustlines[:8]
+                ],
+                hide_index=True,
+            )
+        else:
+            st.info("No trustlines reported for this account.")
+
+    with st.expander("Offers & AMM depth", expanded=False):
+        if offers:
+            st.dataframe(offers[:8], hide_index=True)
+        else:
+            st.info("No standing offers detected.")
+
+    with st.expander("Latest successful transactions", expanded=True):
+        if txs:
+            for tx in txs[:6]:
+                ts = to_datetime(tx.get("date"))
+                st.write(
+                    f"• {tx.get('type') or 'Transaction'} — {tx.get('amount')} "
+                    f"vs {tx.get('counterparty', 'unknown')} ({time_ago(ts) if ts else 'n/a'})"
+                )
+        else:
+            st.info("No recent successful transactions returned by Ripple Data.")
+
+
 # =========================
 # Layout
 # =========================
@@ -1449,6 +1533,19 @@ with st.sidebar:
     if st.button("Manual refresh", type="primary"):
         st.experimental_rerun()
 
+    st.subheader("XRPL Account Inspector")
+    default_account = normalize_env_value("XRPL_INSPECT_ACCOUNT")
+    account_input = st.text_input(
+        "Classic address or X-address", value=default_account, placeholder="r..."
+    )
+    tag_raw = st.text_input("Destination tag (optional)", value="")
+    tag_value: Optional[int] = None
+    if tag_raw.strip():
+        if tag_raw.strip().isdigit():
+            tag_value = int(tag_raw.strip())
+        else:
+            st.warning("Destination tags must be numeric.")
+
 refresh_enabled = get_state("refresh_enabled", True)
 refresh_seconds = get_state("refresh_seconds", DEFAULT_REFRESH)
 
@@ -1462,6 +1559,8 @@ st.title("XRP Quant Governance Console")
 st.caption(
     "Institutional-grade monitoring of price, funding, liquidity, and sentiment — engineered for repeatability and auditability."
 )
+
+account_address, account_tag, account_notes = parse_account_input(account_input, tag_value)
 
 creds = load_api_credentials()
 price_snapshot = fetch_price_snapshot()
@@ -1488,6 +1587,12 @@ if coverage_budget > 0:
 else:
     adjusted_composite = raw_composite
 
+account_overview = (
+    load_account_snapshot(account_address)
+    if account_address
+    else {"account": None, "trustlines": [], "transactions": [], "offers": []}
+)
+
 render_market_header(price_snapshot, flows)
 st.divider()
 
@@ -1505,6 +1610,9 @@ with col_right:
     render_sentiment_panel(sentiment)
     st.divider()
     render_health_panel(creds, price_snapshot, sentiment)
+
+st.divider()
+render_account_panel(account_address, account_tag, account_overview, account_notes)
 
 st.markdown("""
 ---

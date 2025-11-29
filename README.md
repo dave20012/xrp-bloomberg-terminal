@@ -78,6 +78,14 @@ Streamlit dashboard with supporting workers that surface XRP price action, XRPL 
    Adjust `--entry` and `--exit` to reflect your risk tolerance.  The
    script prints both the strategy and buy‑and‑hold cumulative returns.
 
+### XRPL account inspector
+- Use the **XRPL Account Intelligence** panel to review balances, trustlines,
+  open offers, and the most recent transactions for any classic address.
+- Paste a classic address (or include a destination tag in `r...:123`
+  format). X-addresses are detected and rejected until offline-safe
+  conversion is available.
+- Set `XRPL_INSPECT_ACCOUNT` in your `.env` to pre-load an address at launch.
+
 ## Deployment (Railway)
 1. Push this repo to your Git provider and connect it to Railway (or push directly via Railway CLI).
 2. **Provision Redis as a separate service**: use the built-in Redis plugin (Dashboard → Plugins → Redis). Railway gives you `REDIS_URL` automatically—no custom Dockerfile is required. Avoid pointing this repo at a Redis service with a start command such as `docker-entrypoint.sh redis-server`; this image is Python-based and does not ship the Redis entrypoint, so the container will crash with `docker-entrypoint.sh: not found`. If you truly need a self-hosted Redis container, create a new Railway service that uses the official `redis:7-alpine` image and a simple start command like `redis-server --save 60 1 --dir $RAILWAY_VOLUME_MOUNT_PATH`.
@@ -119,6 +127,10 @@ Streamlit dashboard with supporting workers that surface XRP price action, XRPL 
 - Use `.env` (based on `.env.example`) locally and Railway project variables in production.
 - Keep API keys scoped minimally; CoinGecko is rate-limited—lowering `META_REFRESH_SECONDS` increases traffic.
 - Missing keys are handled gracefully with cached fallbacks, but the UI now surfaces Redis/cache health hints when data is stale.
+- Outbound HTTP helpers now block non-HTTPS and private-network URLs to reduce
+  the risk of SSRF when user inputs are passed to data fetchers.
+- A lightweight CI workflow (`.github/workflows/ci.yml`) compiles the codebase
+  and runs unit tests on every push/PR.
 
 ## Testing
 Run lightweight unit tests:
