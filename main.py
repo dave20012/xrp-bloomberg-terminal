@@ -934,6 +934,20 @@ def fetch_funding_and_oi() -> Dict[str, Optional[float]]:
         except Exception:  # noqa: BLE001
             oi = None
 
+    # When running in constrained environments (e.g., unit tests or CI without
+    # network access), skip auxiliary lookups that would otherwise trigger
+    # additional HTTP requests. This keeps the fallback behaviour focused on
+    # funding and OI while still returning a valid shape for downstream
+    # consumers.
+    if os.getenv("SKIP_LIVE_FETCH"):
+        return {
+            "funding": funding,
+            "open_interest": oi,
+            "long_short_ratio": None,
+            "aggregated_open_interest": None,
+            "relative_volume": None,
+        }
+
     # Attempt to fetch the long/short ratio for XRP perpetual futures. We first
     # query Binance; if this fails we fall back to Bybit’s account‑ratio endpoint.
     ls_ratio = None
