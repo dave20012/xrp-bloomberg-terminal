@@ -48,8 +48,13 @@ def get_connection() -> psycopg2.extensions.connection:
 
     # Allow a single URL-style secret to drive the connection for external hosts.
     pg_url = _clean_env("PG_URL") or _clean_env("DATABASE_URL")
+    # Accept both postgres:// and postgresql:// schemes by normalising the URL.
+    # Some deployment platforms (e.g. Railway, Heroku) prefix the connection string
+    # with "postgres://", which is not recognised by psycopg2. Normalise this to
+    # "postgresql://" so psycopg2 can parse it. Skip any placeholder values.
     if pg_url and not pg_url.startswith("${"):
-        return psycopg2.connect(dsn=pg_url)
+        normalized_url = pg_url.replace("postgres://", "postgresql://")
+        return psycopg2.connect(dsn=normalized_url)
 
     host = _clean_env("PG_HOST")
     user = _clean_env("PG_USER")
@@ -74,15 +79,17 @@ def initialize_db() -> None:
     Initialise the database schema.
 
     Creates the TimescaleDB extension and tables for market candles, derivatives
-    open interest, on‑chain flows, sentiment feed and signals snapshots. If
-    tables already exist this function is a no‑op. It also converts tables
-    into hypertables to leverage Timescale's time‑series optimisations.
+    open interest, on-chain flows, sentiment feed and signals snapshots. If
+    tables already exist this function is a no-op. It also converts tables
+    into hypertables to leverage Timescale's time-series optimisations.
     """
     conn = get_connection()
     with conn:
         with conn.cursor() as cur:
-            # Install TimescaleDB extension if not present
-            cur.execute("CREATE EXTENSION IF NOT EXISTS timescaledb;")
+            # Enable the TimescaleDB extension. Use CASCADE to ensure any
+            # dependencies are installed as well. Without CASCADE the extension
+            # may fail to load on fresh PostgreSQL instances.
+            cur.execute("CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;")
 
             # Market candles table: OHLCV for spot market
             cur.execute(
@@ -120,7 +127,7 @@ def initialize_db() -> None:
                 "SELECT create_hypertable('derivatives_oi', 'timestamp', if_not_exists => TRUE, migrate_data => TRUE);"
             )
 
-            # On‑chain flows table: XRPL inflows/outflows
+            # On-chain flows table: XRPL inflows/outflows
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS onchain_flows (
@@ -229,7 +236,7 @@ def upsert_derivatives_oi(rows: Iterable[Tuple]) -> None:
 
 def insert_onchain_flow(timestamp: str, flow_in_xrp: float, flow_out_xrp: float) -> None:
     """
-    Insert a single on‑chain flow row.
+    Insert a single on-chain flow row.
     Computes net_flow_xrp automatically.
     """
     net_flow = flow_in_xrp - flow_out_xrp

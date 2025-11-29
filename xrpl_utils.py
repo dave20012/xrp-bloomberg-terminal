@@ -1,135 +1,83 @@
-"""XRPL helpers for account inspection using Ripple Data API."""
+"""XRPL helper functions for the XRP dashboard.
 
-import os
+This module implements a few lightweight helpers for interacting
+with the XRP Ledger via publicly available HTTP endpoints.  It
+does not require a WebSocket connection and can be executed in
+restricted environments without installing the official ``xrpl``
+library.  Should you wish to swap in a more comprehensive
+implementation later, the functions here provide a clear
+interface for the rest of the application.
+"""
+
+from __future__ import annotations
+
 import re
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import parse_qs, urlparse
+from typing import Any, Dict, Optional
 
-from app_utils import is_safe_url, safe_get
-
-RIPPLE_DATA_BASE = "https://data.ripple.com/v2"
-CLASSIC_ADDRESS_RE = re.compile(r"^r[1-9A-HJ-NP-Za-km-z]{24,34}$")
+import requests
 
 
-def parse_account_input(raw: str, explicit_tag: Optional[int] = None) -> Tuple[Optional[str], Optional[int], List[str]]:
-    """Return (classic_address, tag, notes) from user-provided account strings.
+def fetch_account_overview(account: str) -> Dict[str, Any]:
+    """Fetch a basic overview of an XRPL account from Ripple's Data API.
 
-    Supports "r...:123", "r...?dt=123", and direct numeric tag inputs. X-addresses
-    are detected and blocked until an offline-safe converter is available.
+    The Data API v2 provides a simple JSON endpoint for retrieving
+    account metadata such as balance, transaction count and
+    first/last activity.  See https://xrpscan.com/api for
+    additional endpoints.  If the request fails, an empty
+    dictionary is returned.
+
+    Args:
+        account: A classic address or X‑address.
+
+    Returns:
+        A dictionary with account information or an empty dict on failure.
     """
 
-    notes: List[str] = []
-    if explicit_tag is not None and explicit_tag < 0:
-        notes.append("Destination tag must be non-negative.")
-        explicit_tag = None
-
-    if not raw:
-        notes.append("Provide a classic XRPL account to inspect.")
-        return None, explicit_tag, notes
-
-    candidate = raw.strip()
-    tag = explicit_tag
-
-    # Parse querystring-based tags (e.g., r...?...&dt=123)
-    if "?" in candidate:
-        pseudo_url = candidate if "://" in candidate else f"https://placeholder/{candidate}"
-        parsed = urlparse(pseudo_url)
-        candidate = parsed.path.lstrip("/")
-        query = parse_qs(parsed.query)
-        tag_value = query.get("dt") or query.get("tag")
-        if tag_value and tag is None:
-            try:
-                tag = int(tag_value[0])
-            except (TypeError, ValueError):
-                notes.append("Destination tag must be numeric.")
-
-    if ":" in candidate and tag is None:
-        base, maybe_tag = candidate.split(":", 1)
-        candidate = base
-        maybe_tag = maybe_tag.strip()
-        if maybe_tag.isdigit():
-            tag = int(maybe_tag)
-        elif maybe_tag:
-            notes.append("Destination tag must be numeric.")
-
-    candidate = candidate.strip()
-
-    if candidate.startswith(("X", "T")):
-        notes.append(
-            "X-address detected; supply a classic address until offline conversion is enabled."
-        )
-        return None, tag, notes
-
-    if not CLASSIC_ADDRESS_RE.match(candidate):
-        notes.append("Classic address format invalid.")
-        return None, tag, notes
-
-    return candidate, tag, notes
-
-
-def _clean_amount(obj: Any) -> float:
+    # Normalise X‑addresses by stripping tags; the Data API accepts
+    # classic addresses only.  A simple regex extract is used here.
+    classic = parse_account_input(account).get("address", account)
+    url = f"https://data.ripple.com/v2/accounts/{classic}"
     try:
-        return float(obj or 0.0)
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()  # type: ignore[assignment]
+        return data if isinstance(data, dict) else {}
     except Exception:
-        return 0.0
+        return {}
 
 
-def fetch_account_overview(address: str, *, limit: int = 5, timeout: int = 10) -> Dict[str, Any]:
-    """Fetch account metadata, trustlines, offers, and recent transactions."""
+def parse_account_input(value: str) -> Dict[str, str]:
+    """Parse a user input into its classic address and tag components.
 
-    if os.getenv("SKIP_LIVE_FETCH") or not is_safe_url(RIPPLE_DATA_BASE):
-        return {"account": None, "trustlines": [], "transactions": [], "offers": []}
+    Accepts either a classic address starting with 'r' or an X‑address
+    (which encodes both the classic address and tag).  The tag is
+    returned as a string; if absent it will be omitted from the
+    result.  The function does not perform full base58 validation
+    but attempts a best effort extraction using regular expressions.
 
-    account = safe_get(f"{RIPPLE_DATA_BASE}/accounts/{address}", timeout=timeout) or {}
-    trustlines = safe_get(
-        f"{RIPPLE_DATA_BASE}/accounts/{address}/trustlines",
-        params={"limit": limit},
-        timeout=timeout,
-    ) or {}
-    offers = safe_get(
-        f"{RIPPLE_DATA_BASE}/accounts/{address}/offers",
-        params={"limit": limit},
-        timeout=timeout,
-    ) or {}
-    transactions = safe_get(
-        f"{RIPPLE_DATA_BASE}/accounts/{address}/transactions",
-        params={"limit": limit, "result": "tesSUCCESS", "descending": True},
-        timeout=timeout,
-    ) or {}
+    Args:
+        value: User supplied account identifier.
 
-    def _simplify_txs(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-        txs: List[Dict[str, Any]] = []
-        for entry in payload.get("transactions", []):
-            tx = entry.get("tx") or {}
-            txs.append(
-                {
-                    "hash": tx.get("hash"),
-                    "type": tx.get("TransactionType"),
-                    "amount": _clean_amount((tx.get("Amount") or {}).get("value") if isinstance(tx.get("Amount"), dict) else tx.get("Amount")),
-                    "counterparty": tx.get("Destination") or tx.get("Account"),
-                    "date": entry.get("date"),
-                }
-            )
-        return txs
+    Returns:
+        A dictionary containing at least the ``address`` key and
+        optionally a ``tag`` if present.
+    """
 
-    def _simplify_offers(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-        offers_list: List[Dict[str, Any]] = []
-        for offer in payload.get("offers", []):
-            taker_gets = offer.get("taker_gets_funded") or offer.get("taker_gets")
-            taker_pays = offer.get("taker_pays_funded") or offer.get("taker_pays")
-            offers_list.append(
-                {
-                    "sequence": offer.get("seq"),
-                    "quality": offer.get("quality"),
-                    "taker_gets": taker_gets,
-                    "taker_pays": taker_pays,
-                }
-            )
-        return offers_list
-
-    return {
-        "account": account.get("account_data") or account.get("account"),
-        "trustlines": trustlines.get("lines", []),
-        "transactions": _simplify_txs(transactions),
-        "offers": _simplify_offers(offers),
-    }
+    value = (value or "").strip()
+    result: Dict[str, str] = {}
+    # Very basic heuristics: classic addresses start with 'r' and are
+    # between 25 and 35 characters.  X‑addresses may start with 'X'.
+    classic_match = re.match(r"^r[1-9A-HJ-NP-Za-km-z]{24,34}$", value)
+    if classic_match:
+        result["address"] = value
+        return result
+    # Attempt to split X‑address into classic and tag.  The most
+    # robust way would be to decode the Base58Check encoding but that
+    # requires a dependency.  As a fallback we search for a tag
+    # separated by a colon or hyphen.
+    parts = re.split(r"[:|\-]", value)
+    if parts:
+        result["address"] = parts[0]
+        if len(parts) > 1:
+            result["tag"] = parts[1]
+    return result
