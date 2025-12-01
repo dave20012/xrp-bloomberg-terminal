@@ -14,7 +14,11 @@ st.set_page_config(page_title="XRP Intelligence", layout="wide")
 st.title("XRP Intelligence Terminal")
 st.caption("Volume-first analytics, enriched with flows and regulatory context")
 
-create_tables()
+tables_ready = create_tables()
+if not tables_ready:
+    st.warning(
+        "Database connection unavailable. Falling back to cached dashboard snapshot when possible."
+    )
 
 
 def fetch_recent_scores(limit: int = 200) -> pd.DataFrame:

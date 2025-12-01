@@ -3,9 +3,11 @@ from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import JSON, Column, DateTime, Float, Integer, String, create_engine
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 from core.config import settings
+from core.utils import logger
 
 Base = declarative_base()
 
@@ -79,9 +81,22 @@ engine = create_engine(settings.database_url, echo=False, future=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
-def create_tables() -> None:
-    """Create database tables if they do not exist."""
-    Base.metadata.create_all(bind=engine)
+def create_tables() -> bool:
+    """Create database tables if they do not exist.
+
+    Returns
+    -------
+    bool
+        True when the tables were created or already exist, False if the
+        database is unreachable.
+    """
+
+    try:
+        Base.metadata.create_all(bind=engine)
+        return True
+    except SQLAlchemyError as exc:
+        logger.warning("Skipping table creation because the database is unavailable: %s", exc)
+        return False
 
 
 def get_session():
