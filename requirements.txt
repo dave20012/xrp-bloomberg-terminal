@@ -7,7 +7,9 @@ requests==2.31.0
 # SQLAlchemy 2.0.30 breaks on Python 3.13 due to Enum changes; bump to a
 # patched version to restore compatibility.
 SQLAlchemy==2.0.39
-psycopg2-binary==2.9.9
+# psycopg2-binary 2.9.9 wheels are built without Python 3.13 support,
+# leading to import errors. Bump to 2.9.10, which ships compatible wheels.
+psycopg2-binary==2.9.10
 redis==5.0.4
 python-dotenv==1.0.1
 pytest==8.2.2
