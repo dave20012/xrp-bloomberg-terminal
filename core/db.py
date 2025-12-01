@@ -95,7 +95,14 @@ def create_tables() -> bool:
         Base.metadata.create_all(bind=engine)
         return True
     except SQLAlchemyError as exc:
-        logger.warning("Skipping table creation because the database is unavailable: %s", exc)
+        logger.warning(
+            "Skipping table creation because the database is unavailable: %s", exc
+        )
+        return False
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Unexpected error during table creation; continuing without DB: %s", exc
+        )
         return False
 
 
