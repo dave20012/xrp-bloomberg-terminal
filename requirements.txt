@@ -1,6 +1,8 @@
 streamlit==1.36.0
-pandas==2.2.2
-numpy==1.26.4
+# Upgrade pandas and numpy to versions with prebuilt wheels for Python 3.13 to
+# avoid local builds failing during installation.
+pandas==2.2.3
+numpy==2.1.3
 requests==2.31.0
 SQLAlchemy==2.0.30
 psycopg2-binary==2.9.9
