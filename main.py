@@ -187,3 +187,13 @@ st.write(
     never as the primary driver. Scores are deterministic and can be traced back to raw inputs.
     """
 )
+
+
+if __name__ == "__main__" and not st.runtime.exists():
+    import os
+    import sys
+
+    from streamlit.web import cli as stcli
+
+    sys.argv = ["streamlit", "run", os.path.abspath(__file__)]
+    raise SystemExit(stcli.main())
