@@ -77,8 +77,15 @@ class Event(Base):
     severity = Column(Float, nullable=True)
 
 
-engine = create_engine(settings.database_url, echo=False, future=True)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+try:
+    engine = create_engine(settings.database_url, echo=False, future=True)
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+except Exception as exc:  # noqa: BLE001
+    logger.warning(
+        "Database engine unavailable during startup; continuing without DB: %s", exc
+    )
+    engine = None
+    SessionLocal = None
 
 
 def create_tables() -> bool:
@@ -90,6 +97,10 @@ def create_tables() -> bool:
         True when the tables were created or already exist, False if the
         database is unreachable.
     """
+
+    if engine is None:
+        logger.warning("Database engine not initialized; skipping table creation.")
+        return False
 
     try:
         Base.metadata.create_all(bind=engine)
@@ -108,4 +119,7 @@ def create_tables() -> bool:
 
 def get_session():
     """Provide a new SQLAlchemy session."""
+    if SessionLocal is None:
+        raise RuntimeError("Database is not available; cannot create a session.")
+
     return SessionLocal()
