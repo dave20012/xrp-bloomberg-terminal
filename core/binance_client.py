@@ -1,7 +1,6 @@
-"""Lightweight Binance API client for XRP pairs."""
 from __future__ import annotations
+"""Lightweight Binance API client for XRP pairs."""
 
-from datetime import datetime
 from typing import Any, Dict, List
 
 import requests
