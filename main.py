@@ -6,7 +6,14 @@ from typing import Dict
 import pandas as pd
 import streamlit as st
 
-from core.db import CompositeScore, DerivativesMetric, ExchangeFlow, OHLCV, SessionLocal, create_tables
+from core.db import (
+    CompositeScore,
+    DerivativesMetric,
+    ExchangeFlow,
+    OHLCV,
+    create_tables,
+    get_session,
+)
 from core.redis_client import get_cached_json
 from core.utils import logger
 
@@ -22,7 +29,7 @@ if not tables_ready:
 
 
 def fetch_recent_scores(limit: int = 200) -> pd.DataFrame:
-    session = SessionLocal()
+    session = get_session()
     with session.begin():
         rows = (
             session.query(CompositeScore)
@@ -46,7 +53,7 @@ def fetch_recent_scores(limit: int = 200) -> pd.DataFrame:
 
 
 def fetch_flows(limit: int = 200) -> pd.DataFrame:
-    session = SessionLocal()
+    session = get_session()
     with session.begin():
         rows = (
             session.query(ExchangeFlow)
@@ -67,7 +74,7 @@ def fetch_flows(limit: int = 200) -> pd.DataFrame:
 
 
 def fetch_oi_metrics(limit: int = 200) -> pd.DataFrame:
-    session = SessionLocal()
+    session = get_session()
     with session.begin():
         rows = (
             session.query(DerivativesMetric)
@@ -89,7 +96,7 @@ def fetch_oi_metrics(limit: int = 200) -> pd.DataFrame:
 
 
 def fetch_price_volume(limit: int = 400) -> pd.DataFrame:
-    session = SessionLocal()
+    session = get_session()
     with session.begin():
         rows = (
             session.query(OHLCV)
