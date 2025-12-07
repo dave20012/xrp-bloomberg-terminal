@@ -3,25 +3,44 @@ import os
 from dataclasses import dataclass
 
 
+def looks_like_placeholder(raw: str, name: str | None = None) -> bool:
+    """Detect common template strings that should not be used as secrets."""
+
+    if raw is None:
+        return True
+
+    value = raw.strip()
+    if not value:
+        return True
+
+    prefixes = ("${{", "${", "{{")
+    suffixes = ("}}", "}")
+    if any(value.startswith(prefix) for prefix in prefixes) and any(
+        value.endswith(suffix) for suffix in suffixes
+    ):
+        return True
+
+    if name is not None and value == f"${{{name}}}":
+        return True
+
+    return False
+
+
 def _coalesce_env(name: str, default: str) -> str:
     """Return a usable environment value, falling back when unset or templated.
 
     Some deployment environments populate variables with placeholders such as
-    ``${DATABASE_URL}`` when an actual value is not provided. These strings are
-    not valid connection URLs and cause SQLAlchemy to fail during import. This
-    helper treats missing, empty, or placeholder values as absent and returns
-    the provided default instead.
+    ``${DATABASE_URL}`` or ``${{Redis.REDIS_URL}}`` when an actual value is not
+    provided. These strings are not valid connection URLs and cause downstream
+    clients to fail during import. This helper treats missing, empty, or
+    placeholder values as absent and returns the provided default instead.
     """
 
     value = os.getenv(name)
-    if value is None:
+    if looks_like_placeholder(value, name=name):
         return default
 
-    stripped = value.strip()
-    if not stripped or stripped == f"${{{name}}}":
-        return default
-
-    return stripped
+    return value.strip()
 
 
 @dataclass(slots=True)

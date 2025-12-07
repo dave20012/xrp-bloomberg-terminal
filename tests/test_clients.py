@@ -14,7 +14,7 @@ class DummyResponse:
 
 
 def test_binance_order_book(monkeypatch):
-    def fake_get(url, params=None, headers=None, timeout=10):
+    def fake_get(url, params=None, headers=None, timeout=10, **kwargs):
         return DummyResponse({"bids": [["0.5", "100"]], "asks": [["0.6", "50"]]})
 
     monkeypatch.setattr(binance_client.requests, "get", fake_get)
