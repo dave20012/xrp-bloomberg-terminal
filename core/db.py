@@ -1,5 +1,5 @@
 """Database models and session helpers using SQLAlchemy."""
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Optional
 
 from sqlalchemy import JSON, Column, DateTime, Float, Integer, String, create_engine
@@ -13,7 +13,7 @@ Base = declarative_base()
 
 
 def utcnow() -> datetime:
-    return datetime.utcnow()
+    return datetime.now(UTC)
 
 
 class OHLCV(Base):
