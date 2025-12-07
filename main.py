@@ -21,7 +21,15 @@ st.set_page_config(page_title="XRP Intelligence", layout="wide")
 st.title("XRP Intelligence Terminal")
 st.caption("Volume-first analytics, enriched with flows and regulatory context")
 
-tables_ready = create_tables()
+try:
+    tables_ready = create_tables()
+except Exception as exc:  # noqa: BLE001
+    tables_ready = False
+    logger.warning(
+        "Database initialization failed; using cached dashboard snapshot when possible: %s",
+        exc,
+    )
+
 if not tables_ready:
     st.warning(
         "Database connection unavailable. Falling back to cached dashboard snapshot when possible."
