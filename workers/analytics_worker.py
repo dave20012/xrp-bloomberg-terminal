@@ -5,8 +5,21 @@ import argparse
 import time
 from datetime import datetime, timedelta
 
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
+
 from core import binance_client
-from core.db import CompositeScore, DerivativesMetric, Event, ExchangeFlow, OHLCV, SessionLocal, create_tables
+from core.config import settings
+from core.db import (
+    CompositeScore,
+    DerivativesMetric,
+    Event,
+    ExchangeFlow,
+    OHLCV,
+    SessionLocal,
+    create_tables,
+    engine,
+)
 from core.redis_client import cache_json
 from core.signals import (
     FlowSignal,
@@ -23,8 +36,56 @@ from core.utils import logger
 create_tables()
 
 
+def _log_db_status() -> None:
+    url = settings.database_url
+
+    if SessionLocal is None or engine is None:
+        logger.info("Analytics worker database status: unavailable (url=%s)", url)
+        return
+
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+        logger.info("Analytics worker database status: connected (url=%s)", url)
+    except SQLAlchemyError as exc:
+        logger.warning(
+            "Analytics worker database status: unavailable (url=%s): %s", url, exc
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Analytics worker database status: unexpected error (url=%s): %s", url, exc
+        )
+
+
+def _session_factory_ready() -> bool:
+    if SessionLocal is None or engine is None:
+        logger.warning(
+            "Database engine not configured; skipping analytics run.")
+        return False
+
+    try:
+        session = SessionLocal()
+        session.close()
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Could not create database session; skipping analytics run: %s", exc
+        )
+        return False
+
+
+def _get_session():
+    try:
+        return SessionLocal()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not create database session: %s", exc)
+        return None
+
+
 def _load_recent_data(hours: int = 48):
-    session = SessionLocal()
+    session = _get_session()
+    if session is None:
+        return [], [], [], []
     cutoff = datetime.utcnow() - timedelta(hours=hours)
     with session.begin():
         flows = session.query(ExchangeFlow).filter(ExchangeFlow.timestamp >= cutoff).order_by(ExchangeFlow.timestamp).all()
@@ -51,9 +112,12 @@ def _save_score(flow_sig: FlowSignal, vol_sig: VolumeSignal, oi_score: float, ma
         regulatory_score=regulatory_score,
         overall_score=score,
     )
-    session = SessionLocal()
-    with session.begin():
-        session.add(composite)
+    session = _get_session()
+    if session is not None:
+        with session.begin():
+            session.add(composite)
+    else:
+        logger.info("Database unavailable; skipping composite score persistence.")
     cache_json(
         "latest:score",
         {
@@ -69,6 +133,9 @@ def _save_score(flow_sig: FlowSignal, vol_sig: VolumeSignal, oi_score: float, ma
 
 
 def run_once() -> None:
+    if not _session_factory_ready():
+        return
+
     flows, oi_metrics, ohlcv, events = _load_recent_data()
     flow_values = [f.net_flow_xrp for f in flows]
     volumes = [row.volume for row in ohlcv]
@@ -91,6 +158,7 @@ def run_once() -> None:
 
 
 def main(loop: bool = False, interval: int = 600) -> None:
+    _log_db_status()
     while True:
         try:
             run_once()
