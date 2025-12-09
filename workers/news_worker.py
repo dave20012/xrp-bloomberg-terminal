@@ -38,9 +38,41 @@ def _log_db_status() -> None:
         )
 
 
+def _session_factory_ready() -> bool:
+    if SessionLocal is None or engine is None:
+        logger.warning("Database engine not configured; skipping news persistence.")
+        return False
+
+    try:
+        session = SessionLocal()
+        session.close()
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Could not create database session; skipping news persistence: %s", exc
+        )
+        return False
+
+
+def _get_session():
+    try:
+        return SessionLocal()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not create database session: %s", exc)
+        return None
+
+
 def run_once(limit: int = 20) -> None:
     articles = fetch_latest_news(limit=limit)
-    session = SessionLocal()
+    if not _session_factory_ready():
+        logger.info("Skipping news persistence because database is unavailable.")
+        return
+
+    session = _get_session()
+    if session is None:
+        logger.info("Skipping news persistence because session creation failed.")
+        return
+
     with session.begin():
         for article in articles:
             headline = article.get("title") or ""
