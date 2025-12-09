@@ -5,12 +5,37 @@ import argparse
 import time
 from datetime import datetime
 
-from core.db import Event, SessionLocal, create_tables
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
+
+from core.config import settings
+from core.db import Event, SessionLocal, create_tables, engine
 from core.hf_client import classify_headline
 from core.news_client import fetch_latest_news
 from core.utils import logger
 
 create_tables()
+
+
+def _log_db_status() -> None:
+    url = settings.database_url
+
+    if SessionLocal is None or engine is None:
+        logger.info("News worker database status: unavailable (url=%s)", url)
+        return
+
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+        logger.info("News worker database status: connected (url=%s)", url)
+    except SQLAlchemyError as exc:
+        logger.warning(
+            "News worker database status: unavailable (url=%s): %s", url, exc
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "News worker database status: unexpected error (url=%s): %s", url, exc
+        )
 
 
 def run_once(limit: int = 20) -> None:
@@ -35,6 +60,7 @@ def run_once(limit: int = 20) -> None:
 
 
 def main(loop: bool = False, interval: int = 1800) -> None:
+    _log_db_status()
     while True:
         try:
             run_once()
