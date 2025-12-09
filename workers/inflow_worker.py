@@ -51,6 +51,9 @@ def _session_factory_ready() -> bool:
     if SessionLocal is None or engine is None:
         logger.warning(
             "Database engine not configured; skipping database writes this cycle."
+    if SessionLocal is None:
+        logger.warning(
+            "SessionLocal not configured; skipping database writes this cycle."
         )
         return False
 

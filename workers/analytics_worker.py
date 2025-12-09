@@ -10,6 +10,8 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from core import binance_client
 from core.config import settings
+from core.config import settings
+from core import binance_client
 from core.db import (
     CompositeScore,
     DerivativesMetric,
